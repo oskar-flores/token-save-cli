@@ -5,8 +5,10 @@ llocal — delegate work to local models (Ollama / llama.cpp) instead of paid AP
   llocal doctor                 detect RAM, backends and local models
   llocal bench [--quick]        benchmark every local model that fits in memory
   llocal pick --task code       best local model for a task type ("none" if none is good enough)
+  llocal sheet                  compact cheat sheet so the calling agent can choose a model itself
   llocal run --task code -f a.py -f b.py "prompt"     run on the best local model
   cat x.log | llocal run --task logs "prompt" -       ('-' = also read stdin)
+  llocal feedback ok|bad        after verifying the last run's output: real-world score per model
   llocal stats                  tokens moved off the paid API and estimated savings
   llocal stop                   stop the llama-server that llocal started
 
@@ -38,6 +40,7 @@ HOME = os.path.expanduser(os.environ.get("LLOCAL_HOME", "~/.llocal"))
 CONFIG_PATH = os.path.join(HOME, "config.json")
 BENCH_PATH = os.path.join(HOME, "bench.json")
 USAGE_PATH = os.path.join(HOME, "usage.jsonl")
+FEEDBACK_PATH = os.path.join(HOME, "feedback.jsonl")
 SERVER_STATE = os.path.join(HOME, "server.json")
 SERVER_LOG = os.path.join(HOME, "llama-server.log")
 
@@ -71,6 +74,8 @@ DEFAULT_CONFIG = {
     "price_in_per_mtok": 3.0,
     "price_out_per_mtok": 15.0,
     "request_timeout": 600,
+    # bench stops early on models slower than this (tok/s): too slow to save anyone time
+    "min_tps": 5,
 }
 
 # Task types accepted by `run`/`pick`, mapped to benchmark categories.
@@ -102,8 +107,19 @@ class Fail(Exception):
         self.code, self.hint = code, hint
 
 
+def _self_cmd():
+    """How to invoke this script in hints: `llocal` if that is on PATH and is this file,
+    else `python3 /path/to/llocal.py` (the usual case after `npx skills add`)."""
+    me = os.path.realpath(sys.argv[0] or __file__)
+    on_path = shutil.which("llocal")
+    if on_path and os.path.realpath(on_path) == me:
+        return "llocal"
+    return "python3 " + me.replace(os.path.expanduser("~"), "~", 1)
+
+
+LLOCAL = _self_cmd()
 NO_MODEL_HINT = "do the task yourself; do not retry llocal for this task type"
-BACKEND_HINT = "check `llocal doctor`; meanwhile do the task yourself"
+BACKEND_HINT = f"check `{LLOCAL} doctor`; meanwhile do the task yourself"
 
 
 def ensure_home():
@@ -194,8 +210,20 @@ def gpu_room(cfg):
     for line in apps.strip().splitlines():
         parts = [x.strip() for x in line.split(",")]
         if len(parts) == 3 and parts[2].isdigit() and int(parts[2]) >= 1024 and "ollama" not in parts[1]:
-            hogs.append(f"{parts[1]} pid {parts[0]} {int(parts[2]) / 1024:.1f} GB")
+            name = parts[1] if "no data" not in parts[1].lower() else "process of another user"
+            hogs.append(f"{name} pid {parts[0]} {int(parts[2]) / 1024:.1f} GB")
     return room, ", ".join(hogs)
+
+
+def wait_for_room(cfg, need, timeout=30):
+    """gpu_room(), but if `need` does not fit yet, wait up to `timeout` s: a model that was just
+    unloaded (by llocal or by Ollama's own scheduler) frees its VRAM a few seconds later."""
+    deadline = time.time() + timeout
+    while True:
+        room, hogs = gpu_room(cfg)
+        if room is None or need <= room or time.time() >= deadline:
+            return room, hogs
+        time.sleep(1)
 
 
 def needs_room(model):
@@ -293,6 +321,13 @@ def discover(cfg, verbose=False):
             if verbose:
                 eprint(f"  server {url} not reachable ({e.__class__.__name__})")
     return models
+
+
+def nick(mid):
+    """Shortest unambiguous-enough name for agents: what `run --model` also accepts."""
+    name = short(mid)
+    name = name.removeprefix("ollama:")
+    return re.sub(r"^hf\.co/[^/]+/", "", name)
 
 
 def short(mid):
@@ -484,7 +519,8 @@ def extract_code(text):
     blocks = re.findall(r"```[\w+.-]*[ \t]*\n(.*?)```", text, flags=re.S)
     if blocks:
         return max(blocks, key=len)
-    return text
+    m = re.search(r"```[\w+.-]*[ \t]*\n(.*)", text, flags=re.S)  # fence never closed (cut off)
+    return m.group(1) if m else text
 
 
 def run_python_tests(code, tests, timeout=10):
@@ -604,6 +640,60 @@ A webhook is sent to the URL configured per tenant when the export is ready. Ret
 jobs are retried 3 times with exponential backoff. Authentication uses tenant API keys
 passed in the X-Api-Key header."""
 
+def _long_services_doc():
+    """~8k-token inventory with one relevant entry in the middle (tests real long-context use:
+    a model that truncates or skims the input cannot answer)."""
+    teams = ["platform", "search", "growth", "data", "mobile", "infra", "ml", "security"]
+    lines = []
+    for i in range(1, 321):
+        if i == 173:
+            lines.append("svc-173 | owner: billing-ops | port: 7173 | retries: 9 | "
+                         "purpose: renders monthly invoices and emails them to customers via SMTP")
+            continue
+        lines.append(f"svc-{i:03d} | owner: {teams[i % 8]} | port: {7000 + i} | retries: {i % 4} | "
+                     f"purpose: internal {['cache', 'queue', 'proxy', 'cron', 'index'][i % 5]} worker #{i}")
+    return "\n".join(lines)
+
+
+def check_needle(text):
+    d = parse_json_loose(text)
+    if not isinstance(d, dict):
+        return 0.0
+    return (("173" in str(d.get("service", ""))) + (str(d.get("port")) == "7173") +
+            (str(d.get("retries")) == "9")) / 3
+
+
+def check_tool_plan(text):
+    d = parse_json_loose(text)
+    if not isinstance(d, list) or not d:
+        return 0.0
+    allowed = {"git_log": {"path", "n"}, "read_file": {"path"}, "grep": {"pattern", "path"},
+               "run_tests": {"target"}}
+    calls = [c for c in d if isinstance(c, dict)]
+    valid = calls and all(c.get("tool") in allowed and isinstance(c.get("args"), dict)
+                          and set(c["args"]) <= allowed[c["tool"]] for c in calls)
+    ran = any(c.get("tool") == "run_tests" and "test_api" in str(c.get("args", {}).get("target", ""))
+              for c in calls)
+    history = any(c.get("tool") == "git_log" for c in calls)
+    return (bool(valid) + ran + history + (len(d) == 3)) / 4
+
+
+def check_strict_bullets(text):
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    bullets = [l for l in lines if re.match(r"^([-*•]|\d+[.)])\s+", l)]
+    pts = (len(bullets) == 3) + (len(lines) == len(bullets))
+    pts += bool(bullets) and all(len(re.sub(r"^([-*•]|\d+[.)])\s+", "", b).split()) <= 12 for b in bullets)
+    return pts / 3
+
+
+GET_PATH = '''def get_path(d, path):
+    """Return the value at a dotted path, e.g. get_path({"a": {"b": 1}}, "a.b") == 1."""
+    cur = d
+    for key in path.split("."):
+        cur = cur[key]
+    return cur
+'''
+
 BUGGY_BSEARCH = '''def bsearch(xs, target):
     """Return index of target in sorted list xs, or -1."""
     lo, hi = 0, len(xs)
@@ -693,8 +783,36 @@ SUITE = [
      "prompt": "What does this print?\n```python\nx = [1, 2, 3, 4, 5]\nprint(sum(v*v for v in x if v % 2) - len(x))\n```\n"
                "End with a line 'ANSWER: <number>'.",
      "check": check_answer("30")},
+    # ---- harder, discriminating tasks (suite v2)
+    {"cat": "code", "id": "code_edit", "max_tokens": 900,
+     "prompt": "Modify this function: add an optional `default` parameter. If any key along the path is "
+               "missing (or an intermediate value is not a dict), return `default` when it was given, "
+               "otherwise raise KeyError. `default=None` passed explicitly must return None, so use a "
+               "module-level sentinel object (e.g. `_MISSING = object()`) as the parameter's default. "
+               "Return only the full updated code.\n\n```python\n" + GET_PATH + "```",
+     "check": check_code("d={'a':{'b':{'c':3}},'x':5}\nassert get_path(d,'a.b.c')==3\n"
+                         "assert get_path(d,'a.z',default=7)==7\nassert get_path(d,'x.y',default=1)==1\n"
+                         "assert get_path(d,'a.z',default=None) is None\n"
+                         "try:\n    get_path(d,'a.z')\n    raise SystemExit('no KeyError')\nexcept KeyError:\n    pass")},
+    {"cat": "json", "id": "tool_plan", "max_tokens": 400,
+     "prompt": "Tools: git_log{path, n}, read_file{path}, grep{pattern, path}, run_tests{target}.\n"
+               "User: 'tests/test_api.py started failing after yesterday's changes, find out why'.\n"
+               'Reply with JSON only: a list of exactly 3 tool calls, in the order you would make them, '
+               'each {"tool": <name>, "args": {...}} using only the listed argument names.',
+     "check": check_tool_plan},
+    {"cat": "summary", "id": "long_needle", "max_tokens": 200,
+     "prompt": "Service inventory:\n\n" + _long_services_doc() + "\n\nWhich service sends invoices to "
+               'customers? Reply with JSON only: {"service": ..., "port": <int>, "retries": <int>}',
+     "check": check_needle},
+    {"cat": "summary", "id": "strict_format", "max_tokens": 200,
+     "prompt": "Summarize this doc as exactly 3 bullet points, each at most 12 words. Output only the "
+               "3 bullets, nothing before or after.\n\n" + DOC_TEXT,
+     "check": check_strict_bullets},
 ]
-QUICK_IDS = {"palindrome", "merge_intervals", "order_extract", "tool_choice", "log_rootcause", "boxes", "weekday"}
+# Bump when SUITE changes: older results are re-run by a plain `llocal bench`.
+SUITE_VERSION = 3
+QUICK_IDS = {"palindrome", "merge_intervals", "code_edit", "order_extract", "tool_plan", "log_rootcause",
+             "long_needle", "strict_format", "boxes", "weekday"}
 CATEGORIES = ["code", "json", "summary", "reason"]
 
 
@@ -708,6 +826,9 @@ def bench_model(model, cfg, quick=False):
     except Exception as e:
         return {"error": str(e)[:300]}
     for t in tasks:
+        if len(tps_list) >= 2 and max(tps_list) < cfg["min_tps"]:
+            return {"error": f"too slow: {max(tps_list):.1f} tok/s < min_tps={cfg['min_tps']} "
+                             "(running on CPU?); not used", "suite": SUITE_VERSION}
         msgs = [{"role": "system", "content": SYSTEM_PROMPTS[t["cat"]]},
                 {"role": "user", "content": t["prompt"]}]
         try:
@@ -715,7 +836,10 @@ def bench_model(model, cfg, quick=False):
             score = float(t["check"](r["text"]))
             if r["completion_tokens"] >= 20:
                 tps_list.append(r["tps"])
-            details.append({"id": t["id"], "score": round(score, 2), "s": round(r["seconds"], 1)})
+            d = {"id": t["id"], "score": round(score, 2), "s": round(r["seconds"], 1)}
+            if score < 1:
+                d["answer"] = r["text"][:600]  # to see *why* it lost points (`llocal report` / bench.json)
+            details.append(d)
         except Exception as e:
             errors += 1
             score = 0.0
@@ -727,6 +851,7 @@ def bench_model(model, cfg, quick=False):
     tps = tps_list[len(tps_list) // 2] if tps_list else 0.0
     return {"scores": scores, "overall": round(sum(scores.values()) / len(scores), 3),
             "tps": round(tps, 1), "errors": errors, "details": details, "quick": quick,
+            "suite": SUITE_VERSION,
             "date": time.strftime("%Y-%m-%d %H:%M")}
 
 
@@ -740,6 +865,41 @@ def load_bench():
         return {}
 
 
+def read_jsonl(path):
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue  # skip a corrupt/truncated line instead of failing
+    except OSError:
+        pass
+    return rows
+
+
+def field_stats():
+    """{(model_id, category): [ok, total]} from `llocal feedback`; category None = all tasks."""
+    st = {}
+    for r in read_jsonl(FEEDBACK_PATH):
+        for key in ((r.get("model"), TASK_TO_CATEGORY.get(r.get("task"))), (r.get("model"), None)):
+            ok_n = st.setdefault(key, [0, 0])
+            ok_n[0] += r.get("verdict") == "ok"
+            ok_n[1] += 1
+    return st
+
+
+# Real-world feedback counts like this many benchmark samples' worth of prior: a few bad
+# verdicts lower a model's score, a long track record dominates it.
+PRIOR_WEIGHT = 3
+
+
+def blended(score, ok_n):
+    ok, n = ok_n or (0, 0)
+    return (PRIOR_WEIGHT * score + ok) / (PRIOR_WEIGHT + n)
+
+
 def check_task(task):
     if task not in TASK_TO_CATEGORY:
         raise Fail(1, f"unknown task '{task}'", "use one of: " + ", ".join(TASK_TO_CATEGORY))
@@ -751,16 +911,19 @@ def rank(task, cfg, models=None):
     cat = TASK_TO_CATEGORY[task]
     bench = load_bench()
     available = {m["id"] for m in (models if models is not None else discover(cfg))}
+    field = field_stats()
     out = []
     for mid, res in bench.items():
         if "scores" not in res or mid not in available:
             continue
-        s = res["overall"] if cat is None else res["scores"].get(cat, 0)
+        s = blended(res["overall"] if cat is None else res["scores"].get(cat, 0), field.get((mid, cat)))
         if s < cfg["min_score"]:
             continue
         speed = min(res.get("tps", 0) / 40.0, 1.0)  # 40 tok/s counts as "fast enough"
         out.append((round(s + 0.15 * speed, 4), s, mid, res))
-    out.sort(key=lambda x: x[0], reverse=True)
+    # Ties (common: a category has only a few tests) go to the better all-round model, then the
+    # faster one; otherwise a fast but weak model wins a category on a lucky 2/2.
+    out.sort(key=lambda x: (x[0], x[3].get("overall", 0), x[3].get("tps", 0)), reverse=True)
     return out
 
 
@@ -769,21 +932,29 @@ def no_model_failure(task, cfg):
     bench = {k: v for k, v in load_bench().items() if "scores" in v}
     if not bench:
         return Fail(3, "no benchmark results yet, so no local model is trusted",
-                    "do the task yourself; a human can run `llocal bench --quick` once to enable llocal")
+                    f"do the task yourself; a human can run `{LLOCAL} bench --quick` once to enable llocal")
     cat = TASK_TO_CATEGORY[task]
     good = [k for k, v in bench.items()
             if (v["overall"] if cat is None else v["scores"].get(cat, 0)) >= cfg["min_score"]]
     if good:
         return Fail(2, f"benchmarked models for '{task}' are not reachable now ({', '.join(map(short, good[:3]))})",
-                    "is Ollama / llama-server running? see `llocal doctor`; meanwhile " + NO_MODEL_HINT)
+                    f"is Ollama / llama-server running? see `{LLOCAL} doctor`; meanwhile " + NO_MODEL_HINT)
     return Fail(3, f"no local model scores >= min_score={cfg['min_score']} for '{task}'", NO_MODEL_HINT)
 
 
 def find_model(mid, cfg):
-    for m in discover(cfg):
-        if mid in (m["id"], m["name"], short(m["id"]), "ollama:" + m["name"]):
+    models = discover(cfg)
+    for m in models:
+        if mid in (m["id"], m["name"], short(m["id"]), "ollama:" + m["name"], nick(m["id"])):
             return m
-    raise Fail(1, f"model '{mid}' not found", "run `llocal doctor` to list local models")
+    # forgiving: a unique partial name ("gpt-oss" or "gpt-oss-derestricted:20b") is enough
+    hits = [m for m in models if mid.lower() in m["id"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        raise Fail(1, f"model '{mid}' is ambiguous: " + ", ".join(nick(m["id"]) for m in hits[:6]),
+                   "pass one of those names")
+    raise Fail(1, f"model '{mid}' not found", f"run `{LLOCAL} sheet` to list usable local models")
 
 
 # --------------------------------------------------------------------------- commands
@@ -808,7 +979,7 @@ def cmd_doctor(args, cfg):
         print(f"{short(m['id'])[:60]:<60} {gb(m['size']) if m['size'] else '?':>8}  "
               f"{'yes ' if fits(m, budget) else 'NO  '}  {'yes' if m['id'] in bench else '-'}")
     if not any("scores" in v for v in bench.values()):
-        print("\nNext: `llocal bench --quick` (loads each model once; large models on a GPU take a while)")
+        print(f"\nNext: `{LLOCAL} bench --quick` (loads each model once; large models on a GPU take a while)")
 
 
 def cmd_bench(args, cfg):
@@ -822,15 +993,20 @@ def cmd_bench(args, cfg):
         if not fits(m, budget) and not args.force:
             eprint(f"skip {short(m['id'])} ({gb(m['size'])} > {gb(budget)}: {why}; --force to try)")
             continue
-        if m["id"] in bench and "scores" in bench[m["id"]] and not args.redo:
+        prev = bench.get(m["id"], {})
+        if "scores" in prev and prev.get("suite", 1) == SUITE_VERSION and not args.redo:
             eprint(f"skip {short(m['id'])} (already benchmarked; --redo to repeat)")
+            continue
+        if str(prev.get("error", "")).startswith("too slow") and prev.get("suite") == SUITE_VERSION \
+                and not args.redo:
+            eprint(f"skip {short(m['id'])} ({prev['error'][:40]}...; --redo to retry)")
             continue
         todo.append(m)
     if not todo:
         eprint("nothing to benchmark")
     for i, m in enumerate(todo, 1):
         eprint(f"[{i}/{len(todo)}] {short(m['id'])}  ({gb(m['size']) if m['size'] else '?'})  loading...")
-        room, hogs = gpu_room(cfg)
+        room, hogs = wait_for_room(cfg, needs_room(m))
         if room is not None and needs_room(m) > room and not args.force:
             eprint(f"    skipped: GPU busy, {gb(room)} VRAM free, needs ~{gb(needs_room(m))}"
                    + (f" (in use by: {hogs})" if hogs else "") + "; free it and re-run, or --force")
@@ -852,7 +1028,7 @@ def cmd_report(args, cfg):
     bench = load_bench()
     rows = [(k, v) for k, v in bench.items() if "scores" in v]
     if not rows:
-        print("no benchmark results yet; run `llocal bench --quick`")
+        print(f"no benchmark results yet; run `{LLOCAL} bench --quick`")
         return
     rows.sort(key=lambda kv: kv[1]["overall"], reverse=True)
     print(f"\n{'model':<48} {'code':>5} {'json':>5} {'summ':>5} {'reas':>5} {'all':>5} {'tok/s':>6}")
@@ -865,6 +1041,42 @@ def cmd_report(args, cfg):
     for task in ["code", "json", "summary", "reason", "general"]:
         r = rank(task, cfg, models)
         print(f"  {task:<8} -> {short(r[0][2]) if r else 'none (the agent does it itself)'}")
+
+
+def cmd_sheet(args, cfg):
+    """Compact cheat sheet for the calling agent: what each usable local model is good at,
+    so a stronger model can route by itself (`run --model X`) instead of trusting `rank`."""
+    bench = {k: v for k, v in load_bench().items() if "scores" in v}
+    if not bench:
+        raise no_model_failure("general", cfg)
+    models = {m["id"]: m for m in discover(cfg)}
+    room, hogs = gpu_room(cfg)
+    print(f"# local models (scores 0-1 on llocal's suite; min_score={cfg['min_score']}; "
+          f"call: {LLOCAL} run --model <model> ...)")
+    if room is not None:
+        print(f"# VRAM usable now: {gb(room)}" + (f" (busy: {hogs})" if hogs else ""))
+    field = field_stats()
+    print("model | GB | tok/s | code json summ reas | real ok/n | now | weak spots")
+    for mid, v in sorted(bench.items(), key=lambda kv: -kv[1]["overall"]):
+        if mid not in models:
+            continue
+        m = models[mid]
+        now = "ok" if room is None or needs_room(m) <= room else "no-vram"
+        weak = [f"{d['id']}={d['score']:g}" for d in v.get("details", []) if d.get("score", 0) < 1]
+        sc = v["scores"]
+        old = " (old suite: re-bench)" if v.get("suite", 1) != SUITE_VERSION else ""
+        print(f"{nick(mid)}{old} | {m['size'] / 1024 ** 3:.0f} | {v.get('tps', 0):.0f} | "
+              + " ".join(f"{sc.get(c, 0):.2f}" for c in CATEGORIES)
+              + " | {}/{}".format(*field.get((mid, None), [0, 0])) + f" | {now} | "
+              + (", ".join(weak) or "-"))
+    routes = []
+    for task in ["code", "json", "summary", "reason"]:
+        r = rank(task, cfg, list(models.values()))
+        routes.append(f"{task}->{nick(r[0][2]) if r else 'none'}")
+    print("# default routes: " + ", ".join(routes))
+    print("# weak spots = benchmark tests below 1 (code: palindrome merge_intervals code_edit; json: "
+          "order_extract tool_plan; summ: log_rootcause long_needle strict_format; reas: boxes weekday). "
+          "Models can't run tools.")
 
 
 def cmd_pick(args, cfg):
@@ -931,6 +1143,9 @@ def cmd_run(args, cfg):
         by_id = {m["id"]: m for m in models}
         room, hogs = gpu_room(cfg)
         fitting = [x for x in r if room is None or needs_room(by_id[x[2]]) <= room]
+        if not fitting:  # maybe memory is still being released: wait for the smallest candidate
+            room, hogs = wait_for_room(cfg, min(needs_room(by_id[x[2]]) for x in r))
+            fitting = [x for x in r if room is None or needs_room(by_id[x[2]]) <= room]
         if not fitting:
             raise Fail(2, f"GPU busy: only {gb(room)} VRAM free, the best model for '{args.task}' "
                           f"needs ~{gb(needs_room(by_id[r[0][2]]))}" + (f" (in use by: {hogs})" if hogs else ""),
@@ -965,20 +1180,32 @@ def cmd_run(args, cfg):
                             "in": res["prompt_tokens"] or est_tokens(user),
                             "out": res["completion_tokens"], "s": round(res["seconds"], 1)}) + "\n")
     eprint(f"[llocal] {short(model['id'])}  in={res['prompt_tokens']} out={res['completion_tokens']} "
-           f"{res['tps']:.0f} tok/s  {res['seconds']:.1f}s")
+           f"{res['tps']:.0f} tok/s  {res['seconds']:.1f}s  -> after checking it: `{LLOCAL} feedback ok|bad`")
+
+
+def cmd_feedback(args, cfg):
+    runs = read_jsonl(USAGE_PATH)
+    if args.model:
+        model = find_model(args.model, cfg)["id"]
+        task = args.task or next((r["task"] for r in reversed(runs) if r.get("model") == model), "general")
+    elif runs:
+        model, task = runs[-1]["model"], args.task or runs[-1]["task"]
+    else:
+        raise Fail(1, "no local run to give feedback on", "run `llocal run ...` first, or pass --model")
+    check_task(task)
+    ensure_home()
+    with open(FEEDBACK_PATH, "a") as f:
+        f.write(json.dumps({"ts": time.time(), "model": model, "task": task, "verdict": args.verdict,
+                            "note": args.note or ""}) + "\n")
+    ok, n = field_stats().get((model, TASK_TO_CATEGORY[task]), [0, 0])
+    print(f"recorded {args.verdict} for {short(model)} on '{task}' ({ok}/{n} ok in that category)")
 
 
 def cmd_stats(args, cfg):
     if not os.path.exists(USAGE_PATH):
         print("no local runs yet")
         return
-    rows = []
-    with open(USAGE_PATH) as f:
-        for line in f:
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue  # skip a corrupt/truncated line instead of failing
+    rows = read_jsonl(USAGE_PATH)
     tin = sum(r.get("in", 0) for r in rows)
     tout = sum(r.get("out", 0) for r in rows)
     usd = tin / 1e6 * cfg["price_in_per_mtok"] + tout / 1e6 * cfg["price_out_per_mtok"]
@@ -1007,6 +1234,7 @@ def main():
     b.add_argument("--force", action="store_true", help="also try models larger than the memory budget")
     b.add_argument("--model", help="only models whose id contains this text")
     sub.add_parser("report", help="show benchmark table")
+    sub.add_parser("sheet", help="compact model cheat sheet for agents that route themselves")
     k = sub.add_parser("pick", help="print the best local model for a task (or 'none', exit 3)")
     k.add_argument("--task", default="general", help="|".join(TASK_TO_CATEGORY))
     k.add_argument("-v", "--verbose", action="store_true")
@@ -1021,13 +1249,18 @@ def main():
     r.add_argument("--timeout", type=int, help="seconds to wait for the model (default: request_timeout)")
     r.add_argument("--out", help="write the answer to this file instead of stdout")
     r.add_argument("--json", action="store_true", help="validate and pretty-print JSON output")
+    fb = sub.add_parser("feedback", help="record whether the last run's output was right (after verifying)")
+    fb.add_argument("verdict", choices=["ok", "bad"])
+    fb.add_argument("--model", help="model to rate (default: the one used by the last run)")
+    fb.add_argument("--task", help="task type to rate (default: the last run's)")
+    fb.add_argument("--note", help="short reason, e.g. 'tests failed: off-by-one'")
     sub.add_parser("stats", help="tokens offloaded and estimated savings")
     sub.add_parser("stop", help="stop llama-server / unload Ollama models")
     args = p.parse_args()
     try:
         cfg = load_config()
-        {"doctor": cmd_doctor, "bench": cmd_bench, "report": cmd_report, "pick": cmd_pick, "run": cmd_run,
-         "stats": cmd_stats, "stop": cmd_stop}[args.cmd](args, cfg)
+        {"doctor": cmd_doctor, "bench": cmd_bench, "report": cmd_report, "sheet": cmd_sheet, "pick": cmd_pick, "run": cmd_run,
+         "feedback": cmd_feedback, "stats": cmd_stats, "stop": cmd_stop}[args.cmd](args, cfg)
     except Fail as e:
         eprint(f"llocal: error: {e}" + (f"\nllocal: next: {e.hint}" if e.hint else "") + f"  [exit {e.code}]")
         sys.exit(e.code)

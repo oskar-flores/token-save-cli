@@ -1,104 +1,113 @@
-# llocal — gasta menos API delegando trabajo mecánico a un modelo local
+# llocal: spend fewer API tokens by offloading mechanical work to a local model
 
-Tu agente (Claude Code, Codex, Cursor, Gemini CLI…) resume ficheros, lee logs, saca JSON y
-escribe docstrings con tokens de pago. `llocal` hace ese trabajo con un modelo de **Ollama** o
-**llama.cpp** en tu máquina. El fichero va directo al modelo local, así que no entra en el
-contexto del agente.
+Your coding agent (Claude Code, Codex, Cursor, Gemini CLI…) burns paid tokens summarizing
+files, reading logs, extracting JSON and writing docstrings. `llocal` does that work on an
+**Ollama** or **llama.cpp** model on your machine. Files go straight to the local model and
+never enter the agent's context.
 
-- Elige el modelo **por benchmark** (código con tests reales, JSON, resúmenes, razonamiento,
-  tok/s) y solo usa los que caben en tu GPU/memoria.
-- Si ningún modelo es lo bastante bueno, **falla rápido** con un código claro y el agente lo
-  hace él.
-- Un fichero Python, sin dependencias. No hace falta tocar el PATH.
+- Picks the model **by benchmark** (code checked by real tests, JSON, summaries, reasoning,
+  long context, tok/s) and only uses models that fit your GPU/memory.
+- Gives the agent a **cheat sheet** of what each local model is good at, so a strong agent can
+  route the work itself.
+- **Fails fast** with a clear exit code when no local model is good enough, so the agent does
+  the task itself.
+- One Python file, no dependencies, no PATH changes needed.
 
-## Probarlo en 3 minutos
+## Try it
 
-Requisitos: `python3`, y [Ollama](https://ollama.com) con algún modelo (`ollama pull qwen2.5-coder:7b`).
+Requirements: `python3`, and [Ollama](https://ollama.com) with a model (`ollama pull qwen2.5-coder:7b`).
 
 ```bash
-# 1. Instala el skill (incluye el CLI) en tus agentes
-npx skills add oskar-flores/token-save-cli -g     # o desde una copia local: npx skills add ./token-save-cli -g
+# 1. Install the skill (CLI included) into your agents
+npx skills add oskar-flores/token-save-cli -g     # or from a local clone: npx skills add ./token-save-cli -g
 
-# 2. Comprueba y haz el benchmark una vez (con GPU, cargar cada modelo tarda un poco)
-L=~/.claude/skills/local-offload/scripts/llocal.py   # Claude Code (Codex y otros: ~/.agents/skills/...)
+# 2. Check your setup and benchmark once: ~2–4 min per model (mostly loading it).
+#    To start fast, benchmark just one:  python3 $L bench --quick --model qwen
+L=~/.claude/skills/local-offload/scripts/llocal.py   # Claude Code (Codex and others: ~/.agents/skills/...)
 python3 $L doctor
-python3 $L bench --quick
-python3 $L report
+python3 $L bench --quick        # every model that fits; already-measured ones are skipped
+python3 $L sheet
 ```
 
-Desde aquí tu agente lo usa solo cuando toca (resumir, logs, extraer, docs, tests…).
-Pruébalo a mano:
+From now on your agent uses it when it fits (summaries, logs, extraction, docs, tests…).
+Try it by hand:
 
 ```bash
-python3 $L run --task summary -f README.md "Resume en 5 viñetas"
+python3 $L run --task summary -f README.md "Summarize in 5 bullets"
 ```
 
-¿Prefieres un comando `llocal` en el PATH y el subagente `local-worker` de Claude Code?
-`./install.sh`.
+Want a `llocal` command on your PATH and the Claude Code `local-worker` subagent? Run `./install.sh`.
 
-## Comandos
+## Commands
 
 ```bash
-llocal doctor                                  # memoria/GPU, backends, modelos y si caben
-llocal bench [--quick] [--redo] [--model X]    # benchmark (solo los que falten)
-llocal report                                  # notas y mejor modelo por tarea
-llocal run --task logs -f app.log "¿Qué falló?"
-git diff | llocal run --task docs "mensaje de commit" -
-llocal pick --task code                        # qué modelo se usaría
-llocal stats                                   # tokens delegados y ahorro estimado
-llocal stop                                    # libera la memoria
+llocal doctor                                  # GPU/memory, backends, models and whether they fit
+llocal bench [--quick] [--redo] [--model X]    # benchmark (only what's missing or outdated)
+llocal report                                  # score table and best model per task
+llocal sheet                                   # compact cheat sheet for agents that pick a model
+llocal run --task logs -f app.log "What failed?"
+git diff | llocal run --task docs "commit message" -
+llocal pick --task code                        # which model would be used
+llocal feedback ok|bad [--note ...]            # was the last answer right? improves routing
+llocal stats                                   # tokens offloaded and estimated savings
+llocal stop                                    # free the memory
 ```
 
-Tareas: `code tests refactor boilerplate` · `json extract classify` ·
+Tasks: `code tests refactor boilerplate` · `json extract classify` ·
 `summary docs explain translate logs` · `reason` · `general`.
 
-## Códigos de salida
+## Exit codes
 
-Cada error imprime `llocal: error: …` y `llocal: next: …` (qué hacer), para que el agente sepa
-qué pasa sin adivinar.
+Every error prints `llocal: error: …` and `llocal: next: …` (what to do), so the agent knows
+what happened without guessing.
 
-| exit | significado |
+| exit | meaning |
 |---|---|
 | 0 | ok |
-| 1 | entrada mala: fichero, tarea, prompt vacío, demasiado grande |
-| 2 | backend caído, timeout o respuesta rota |
-| 3 | ningún modelo local apto, o aún no hay benchmark: que lo haga el agente |
-| 4 | `--json` pedido y la salida no es JSON |
+| 1 | bad input: file, task, empty prompt, too large |
+| 2 | backend down, GPU busy, timeout or broken reply |
+| 3 | no local model good enough, or no benchmark yet: the agent should do it |
+| 4 | `--json` requested and the output is not JSON |
 
-## Buenas prácticas
+## Good practices
 
-- **Haz el benchmark tú, una vez.** Sin benchmark, `llocal` no confía en ningún modelo (exit 3).
-  Repite `bench` cuando añadas modelos.
-- **Un modelo cada vez.** `llocal` descarga el anterior antes de cargar otro; no lances varias
-  llamadas en paralelo.
-- **Verifica.** El modelo local es más débil: ejecuta el código que genere y comprueba con
-  `grep` los datos de los que dependa una decisión.
-- **Solo local.** Los modelos `:cloud` de Ollama se ignoran, para que tus ficheros no salgan
-  de la máquina. Los de audio y embeddings, también.
-- **Ajusta la memoria** si el sistema hace swap o la GPU se queda corta (tabla de abajo).
-- Para que todo el equipo lo use, añade a `AGENTS.md` / `CLAUDE.md` del repo:
-  `Antes de resumir/extraer/documentar ficheros grandes, usa el skill local-offload.`
+- **Benchmark once, yourself.** Without a benchmark `llocal` trusts no model (exit 3). Re-run
+  `bench` when you add models or update llocal (outdated results are re-measured automatically).
+- **Let the agent choose.** A strong agent reads `llocal sheet` (what each model is good at,
+  speed, weak spots) and picks with `--model`; otherwise `llocal` picks by benchmark.
+- **Close the loop.** After checking an answer, `llocal feedback ok|bad`: models that fail in
+  real use drop in routing, even if they scored well in the benchmark.
+- **One model at a time.** `llocal` unloads the previous model before loading another; don't
+  run several calls in parallel.
+- **Verify.** The local model is weaker: run the code it writes, and `grep` any fact a decision
+  depends on.
+- **Local only.** Ollama `:cloud` models are ignored so your files never leave the machine.
+  Audio and embedding models are ignored too.
+- **Tune memory** if the system swaps or the GPU runs short (table below).
+- To make your whole team use it, add to the repo's `AGENTS.md` / `CLAUDE.md`:
+  `Before summarizing/extracting/documenting large files, use the local-offload skill.`
 
-## Configuración (`~/.llocal/config.json`, o `LLOCAL_HOME`)
+## Configuration (`~/.llocal/config.json`, or `LLOCAL_HOME`)
 
-| clave | por defecto | qué hace |
+| key | default | what it does |
 |---|---|---|
-| `vram_fraction` | 0.9 | con GPU NVIDIA: tamaño máximo de modelo = 90 % de la VRAM |
-| `mem_fraction` | 0.62 | sin NVIDIA (Mac, CPU): 62 % de la RAM |
-| `max_model_gb` | `null` | fija el límite a mano (gana a los dos anteriores) |
-| `ctx` | 16384 | contexto del modelo; bájalo si va justo de memoria |
-| `min_score` | 0.6 | nota mínima (0–1) para usar un modelo en una categoría |
-| `request_timeout` | 600 | segundos de espera (o `run --timeout`) |
+| `vram_fraction` | 0.9 | with an NVIDIA GPU: max model size = 90 % of VRAM |
+| `mem_fraction` | 0.62 | without NVIDIA (Mac, CPU): 62 % of RAM |
+| `max_model_gb` | `null` | set the limit by hand (overrides both above) |
+| `ctx` | 16384 | model context; lower it if memory is tight |
+| `min_score` | 0.6 | minimum score (0–1) to use a model for a category |
+| `min_tps` | 5 | models slower than this (tok/s) are dropped during `bench` |
+| `request_timeout` | 600 | seconds to wait (or `run --timeout`) |
 | `ollama_url` | `http://localhost:11434` | |
-| `servers` | `[]` | otros endpoints OpenAI-compatibles ya arrancados |
-| `gguf_dirs` | `~/models`, cachés de llama.cpp/LM Studio | dónde buscar `.gguf` |
-| `price_in_per_mtok` / `price_out_per_mtok` | 3 / 15 | solo para el ahorro de `llocal stats` |
+| `servers` | `[]` | other OpenAI-compatible endpoints already running |
+| `gguf_dirs` | `~/models`, llama.cpp/LM Studio caches | where to look for `.gguf` files |
+| `price_in_per_mtok` / `price_out_per_mtok` | 3 / 15 | only for the savings shown by `llocal stats` |
 
-## Notas
+## Notes
 
-- El benchmark **ejecuta el código que genera el modelo** (directorio temporal, `python -I`,
-  10 s de límite) para ver si pasa los tests.
-- Los modos "thinking" (Qwen3, etc.) se desactivan o se quitan los `<think>`.
-- Subagentes 100 % locales: posible con
-  [claude-code-router](https://github.com/musistudio/claude-code-router), pero los modelos
-  pequeños llevan mal el bucle de herramientas. El skill es la vía recomendada.
+- The benchmark **runs the code the model writes** (temp dir, `python -I`, 10 s limit) to see
+  whether it passes the tests.
+- "Thinking" modes (Qwen3, etc.) are disabled, or `<think>` blocks are stripped.
+- Fully local subagents are possible with
+  [claude-code-router](https://github.com/musistudio/claude-code-router), but small models
+  handle the tool loop poorly. The skill is the recommended path.
