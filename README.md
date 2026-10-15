@@ -10,6 +10,7 @@ the agent's context.
 - Picks the model **by benchmark**, and only models that fit your GPU/memory.
 - Gives the agent a **cheat sheet** of what each local model is good at.
 - **Fails fast** with a clear exit code when no local model is good enough.
+- Reports the **net** API cost saved, and warns when an offload wasn't worth it.
 - One Python file, no dependencies, no PATH changes.
 
 <br>
@@ -46,8 +47,9 @@ python3 $L sheet
 python3 $L run --task summary -f README.md "Summarize in 5 bullets"
 ```
 
-> Want a `llocal` command on your PATH and the Claude Code `local-worker` subagent?
-> Run `./install.sh`.
+> Want a `llocal` command on your PATH, the Claude Code `local-worker` subagent and a
+> SessionStart hook that puts `llocal sheet` in every new session? Run `./install.sh`
+> (`--no-agent`, `--no-hook` to skip parts).
 
 <br>
 
@@ -63,10 +65,11 @@ llocal sheet                                  # compact cheat sheet for agents
 llocal pick --task code                       # which model would be used
 
 llocal run --task logs -f app.log "What failed?"
+llocal run --task summary --glob 'src/**/*.py' "one line per module"
 git diff | llocal run --task docs "commit message" -
 
 llocal feedback ok|bad [--note ...]           # rate the last answer
-llocal stats                                  # tokens offloaded and savings
+llocal stats                                  # tokens offloaded and net savings
 llocal stop                                   # free the memory
 ```
 
@@ -102,6 +105,10 @@ Errors print `llocal: error: …` and `llocal: next: …` (what to do).
   models or updating llocal.
 - **Let the agent choose.** It reads `llocal sheet` and picks with `--model`.
 - **Close the loop.** `llocal feedback ok|bad` after checking an answer improves routing.
+- **Offload big inputs only.** It pays when files go in by `-f`/`--glob`/stdin and are ~1k+
+  tokens, or a long answer goes to `--out`. Pasting text into the command costs more than
+  doing it yourself. `llocal stats` shows the net saving (bad-rated runs don't count) and
+  `run` warns on stderr when a run likely lost money.
 - **One model at a time.** Don't run calls in parallel.
 - **Verify.** Local models are weaker: run their code, check their facts.
 - **Local only.** Ollama `:cloud`, audio and embedding models are ignored.
@@ -126,7 +133,7 @@ File: `~/.llocal/config.json` (or set `LLOCAL_HOME`).
 | `ollama_url` | `http://localhost:11434` | |
 | `servers` | `[]` | other OpenAI-compatible endpoints |
 | `gguf_dirs` | `~/models`, llama.cpp/LM Studio caches | where to find `.gguf` files |
-| `price_in_per_mtok` / `price_out_per_mtok` | 3 / 15 | only for `llocal stats` |
+| `price_in_per_mtok` / `price_out_per_mtok` | 2 / 10 | API prices for savings estimates (Sonnet 5.5) |
 
 <br>
 
@@ -134,6 +141,17 @@ File: `~/.llocal/config.json` (or set `LLOCAL_HOME`).
 
 - The benchmark **runs the code the model writes** (temp dir, `python -I`, 10 s limit).
 - "Thinking" modes (Qwen3, etc.) are disabled, or `<think>` blocks are stripped.
+- **SessionStart hook** (Claude Code only; `install.sh` adds it). To add it by hand, in
+  `~/.claude/settings.json`:
+
+  ```json
+  {"hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{"type": "command",
+    "command": "python3 ~/.claude/skills/local-offload/scripts/llocal.py sheet 2>/dev/null || true",
+    "timeout": 10}]}]}}
+  ```
+
+  It only gives the agent the model list; the agent still decides when to offload.
+- Decision models (e.g. Ollama `nimble`) are not chat models and are ignored.
 - Fully local subagents are possible with
   [claude-code-router](https://github.com/musistudio/claude-code-router), but small models
   handle the tool loop poorly. The skill is the recommended path.

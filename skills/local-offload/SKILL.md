@@ -14,14 +14,17 @@ PATH). Below, `llocal` means either.
 ## Use
 
 1. Once per session: `llocal sheet` (a few hundred words): what each local model is good at, its
-   speed, weak spots, and whether it fits on the GPU right now.
-2. Delegate, passing paths with `-f`. **Do not read the file first**: that is the saving.
+   speed, weak spots, and whether it fits on the GPU right now. Skip it if the sheet is already
+   in your context (a SessionStart hook may have added it).
+2. Delegate, passing paths with `-f` (or a quoted `--glob 'src/**/*.py'`). **Do not read the
+   file first**: that is the saving.
 
 ```bash
 llocal run --task summary -f src/billing.py "Responsibilities and fragile spots, ≤10 bullets"
 llocal run --task logs -f app.log "What failed, when, and likely cause? ≤120 words"
 llocal run --task extract --json -f CHANGELOG.md "JSON list of {version, date, breaking}"
 llocal run --task tests -f dates.py --out /tmp/test_dates.py "pytest tests for parse_date"
+llocal run --task summary --glob 'src/api/**/*.py' "One line per module: what it does"
 git diff --staged | llocal run --task docs "Conventional commit message" -
 ```
 
@@ -34,8 +37,9 @@ git diff --staged | llocal run --task docs "Conventional commit message" -
 - A trailing `-` also reads stdin. `--out F` writes the answer to F.
 - One call at a time, never in parallel. The first call loads the model: it can take a minute.
 
-**Don't delegate:** multi-file changes, design, hard debugging, security, concurrency, or
-anything that needs tools in a loop.
+**Don't delegate:** multi-file changes, design, hard debugging, security, concurrency,
+anything that needs tools in a loop, or small inputs (under ~1k tokens / 4 KB) and text you
+would have to paste into the command: writing it costs more than doing the task yourself.
 
 ## On failure: read the exit code, don't retry blindly
 

@@ -10,7 +10,8 @@ You are a coordinator. Do NOT do the work yourself or read whole files: delegate
 0. Command: `llocal` if it exists; otherwise `python3 ~/.claude/skills/local-offload/scripts/llocal.py`.
    If neither exists, reply exactly `LOCAL_UNAVAILABLE: llocal not installed` and stop.
 1. Find the relevant files (Glob/Grep if needed, without reading their full contents).
-2. Run `llocal run --task <type> -f <file> [-f <other>] "<precise instruction>"`.
+2. Run `llocal run --task <type> -f <file> [-f <other>] "<precise instruction>"`
+   (or `--glob 'dir/**/*.ext'` for many files). Never paste file contents into the command.
    Types: summary, docs, explain, logs, extract, classify, json, code, tests, boilerplate, translate.
    For large inputs, split by file and run the calls ONE AFTER ANOTHER.
 3. For code, save it with `--out` and run/test it before accepting it.

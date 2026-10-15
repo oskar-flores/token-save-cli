@@ -70,9 +70,9 @@ DEFAULT_CONFIG = {
     "min_score": 0.6,
     "exclude": ["embed", "embedding", "nomic", "bge", "mxbai", "whisper", "mmproj", "asr"],
     # Prices used ONLY to estimate savings in `llocal stats` (USD per million tokens).
-    # Set them to the model your subagents would otherwise use.
-    "price_in_per_mtok": 3.0,
-    "price_out_per_mtok": 15.0,
+    # Set them to the model that would otherwise do the work (default: Claude Sonnet 5.5).
+    "price_in_per_mtok": 2.0,
+    "price_out_per_mtok": 10.0,
     "request_timeout": 600,
     # bench stops early on models slower than this (tok/s): too slow to save anyone time
     "min_tps": 5,
@@ -260,7 +260,25 @@ def strip_thinking(text):
 
 
 def est_tokens(text):
-    return max(1, len(text) // 4)
+    return max(1, len(text) * 2 // 7)  # ~3.5 chars/token, same estimate as the input limit
+
+
+# Agent-side tokens per run that a local run can't avoid: the stderr line, verifying, feedback.
+RUN_OVERHEAD_TOKENS = 150
+
+
+def net_saving(row, cfg):
+    """Estimated USD the calling agent saved with one run (negative = offloading cost more).
+    Avoided: reading the files/stdin and writing the answer itself. Spent: writing the prompt
+    words (output price) and reading the answer back unless it went to --out."""
+    p_in, p_out = cfg["price_in_per_mtok"] / 1e6, cfg["price_out_per_mtok"] / 1e6
+    if "in_ctx" not in row:  # rows from before llocal logged the split: old gross estimate
+        return row.get("in", 0) * p_in + row.get("out", 0) * p_out
+    out = row.get("out", 0)
+    avoided = row["in_ctx"] * p_in + out * p_out
+    spent = (row.get("in_prompt", 0) * p_out + (0 if row.get("to_file") else out * p_in)
+             + RUN_OVERHEAD_TOKENS * p_in)
+    return avoided - spent
 
 
 # --------------------------------------------------------------------------- discovery
@@ -281,7 +299,7 @@ def discover(cfg, verbose=False):
                 continue  # Ollama cloud model: would send your files off this machine
             caps = m.get("capabilities")
             if caps is not None and "completion" not in caps:
-                continue
+                continue  # embedding, or a decision model (e.g. nimble): not a chat model
             models.append({"id": "ollama:" + name, "backend": "ollama", "name": name,
                            "size": int(m.get("size", 0))})
     except Exception as e:
@@ -1114,10 +1132,13 @@ def cmd_run(args, cfg):
     use_stdin = "-" in words
     words = [w for w in words if w != "-"]
     prompt = " ".join(words)
+    piped = ""
     if use_stdin and not sys.stdin.isatty():
         piped = sys.stdin.read()
         if piped.strip():
             prompt = (prompt + "\n\n" + piped) if prompt else piped
+        else:
+            piped = ""
     if not prompt.strip():
         raise Fail(1, "empty prompt", "give the instruction as an argument; add '-' to also read stdin")
     budget_tokens = cfg["ctx"] - args.max_tokens - 512
@@ -1127,7 +1148,13 @@ def cmd_run(args, cfg):
     # 3.5 chars/token is optimistic for dense code; Ollama silently drops the start of a prompt
     # that overflows num_ctx, so stay on the safe side.
     max_input_chars = int(budget_tokens * 3.5)
-    ctx_text = read_files(args.files, max_input_chars) if args.files else ""
+    files = list(args.files)
+    for pat in args.globs:
+        hits = sorted(p for p in glob.glob(os.path.expanduser(pat), recursive=True) if os.path.isfile(p))
+        if not hits:
+            raise Fail(1, f"--glob {pat!r} matched no files", "check the pattern; quote it so the shell doesn't expand it")
+        files += [p for p in hits if p not in files]
+    ctx_text = read_files(files, max_input_chars) if files else ""
     user = (ctx_text + "\n\n" + prompt) if ctx_text else prompt
     if len(user) > max_input_chars:
         raise Fail(1, f"input too large for the local context (~{len(user) * 2 // 7} tokens, limit "
@@ -1175,12 +1202,19 @@ def cmd_run(args, cfg):
         print(f"wrote {args.out} ({len(out)} chars)")
     else:
         print(out)
+    words_text = " ".join(words)
+    row = {"ts": time.time(), "task": args.task, "model": model["id"],
+           "in": res["prompt_tokens"] or est_tokens(user), "out": res["completion_tokens"],
+           "in_ctx": est_tokens(ctx_text + piped) if (ctx_text or piped) else 0,
+           "in_prompt": est_tokens(words_text) if words_text else 0,
+           "to_file": bool(args.out), "s": round(res["seconds"], 1)}
     with open(USAGE_PATH, "a") as f:
-        f.write(json.dumps({"ts": time.time(), "task": args.task, "model": model["id"],
-                            "in": res["prompt_tokens"] or est_tokens(user),
-                            "out": res["completion_tokens"], "s": round(res["seconds"], 1)}) + "\n")
+        f.write(json.dumps(row) + "\n")
     eprint(f"[llocal] {short(model['id'])}  in={res['prompt_tokens']} out={res['completion_tokens']} "
            f"{res['tps']:.0f} tok/s  {res['seconds']:.1f}s  -> after checking it: `{LLOCAL} feedback ok|bad`")
+    if net_saving(row, cfg) < 0:
+        eprint("[llocal] note: this run likely cost more API tokens than doing it yourself (small input, "
+               "answer read back); offload inputs of ~1k+ tokens passed by -f/--glob/stdin")
 
 
 def cmd_feedback(args, cfg):
@@ -1206,15 +1240,25 @@ def cmd_stats(args, cfg):
         print("no local runs yet")
         return
     rows = read_jsonl(USAGE_PATH)
+    # A `feedback bad` applies to the latest run of that model before it: the agent redid that work.
+    bad = set()
+    for fb in read_jsonl(FEEDBACK_PATH):
+        if fb.get("verdict") != "bad":
+            continue
+        prior = [i for i, r in enumerate(rows) if r.get("model") == fb.get("model") and r.get("ts", 0) <= fb.get("ts", 0)]
+        if prior:
+            bad.add(prior[-1])
     tin = sum(r.get("in", 0) for r in rows)
     tout = sum(r.get("out", 0) for r in rows)
-    usd = tin / 1e6 * cfg["price_in_per_mtok"] + tout / 1e6 * cfg["price_out_per_mtok"]
+    usd = sum(net_saving(r, cfg) for i, r in enumerate(rows) if i not in bad)
+    losing = sum(1 for i, r in enumerate(rows) if i not in bad and net_saving(r, cfg) < 0)
     by_task = {}
     for r in rows:
         by_task[r.get("task", "?")] = by_task.get(r.get("task", "?"), 0) + 1
     print(f"local runs: {len(rows)}   tokens in: {tin:,}   tokens out: {tout:,}")
-    print(f"estimated API cost avoided: ${usd:.2f}  (at ${cfg['price_in_per_mtok']}/M in, "
+    print(f"estimated net API cost saved: ${usd:.2f}  (at ${cfg['price_in_per_mtok']}/M in, "
           f"${cfg['price_out_per_mtok']}/M out — edit in {CONFIG_PATH})")
+    print(f"not counted: {len(bad)} run(s) rated bad; runs that cost more than they saved: {losing}")
     print("by task: " + ", ".join(f"{k}={v}" for k, v in sorted(by_task.items())))
 
 
@@ -1243,6 +1287,8 @@ def main():
     r.add_argument("--task", default="general", help="|".join(TASK_TO_CATEGORY))
     r.add_argument("-f", "--file", dest="files", action="append", default=[],
                    help="file given to the model as context (repeatable: -f a.py -f b.py)")
+    r.add_argument("-g", "--glob", dest="globs", action="append", default=[],
+                   help="quoted glob of context files, ** recursive (repeatable: -g 'src/**/*.py')")
     r.add_argument("--model", help="force a model id/name")
     r.add_argument("--max-tokens", type=int, default=2048)
     r.add_argument("--temperature", type=float, default=0.2)
