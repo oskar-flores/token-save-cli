@@ -1,6 +1,6 @@
 ---
 name: local-offload
-description: Use when about to summarize, explain, extract to JSON, classify, document, translate or draft tests/boilerplate from files, logs or diffs, or before spawning a subagent for that kind of mechanical work, and API token budget matters. Runs it on a local Ollama/llama.cpp model instead.
+description: "Use this skill before reading any large input (big log, long diff, many files, whole module) just to produce text from it: a summary or digest, a root-cause readout of a log, a PR description or changelog notes from a diff, a list of breaking changes, JSON extraction, classification, translation, docstrings or comments added without changing logic, or draft tests and boilerplate. It also applies when a plan step or a subagent you're about to spawn would do that kind of bulk read-and-write work. Before opening the file, check here first. The skill hands the reading to a local Ollama/llama.cpp model so the file never fills your context and Claude tokens are saved. Don't use it for tiny inline inputs, design, debugging that changes code, or multi-file refactors."
 ---
 
 # Offload mechanical work to a local model
@@ -36,6 +36,15 @@ git diff --staged | llocal run --task docs "Conventional commit message" -
   handle it. Given ambiguous requirements, local models ramble until they run out of tokens.
 - A trailing `-` also reads stdin. `--out F` writes the answer to F.
 - One call at a time, never in parallel. The first call loads the model: it can take a minute.
+
+## Plans
+
+When you write a plan or task list (plan mode, a to-do list, `PLAN.md`…), mark mechanical
+steps `[local: --task <type> -f <file>]`. You see the whole job there, so that is the cheapest
+place to decide, and whoever carries out the step (you later, or a fresh subagent) won't have to.
+When carrying out a marked step, call `llocal run` without reading the file first, and still
+do it yourself on a non-zero exit, a small input or a bad answer. Never mark design,
+debugging or multi-file changes.
 
 **Don't delegate:** multi-file changes, design, hard debugging, security, concurrency,
 anything that needs tools in a loop, or small inputs (under ~1k tokens / 4 KB) and text you

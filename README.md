@@ -104,6 +104,8 @@ Errors print `llocal: error: …` and `llocal: next: …` (what to do).
 - **Benchmark once.** No benchmark = no trusted model (exit 3). Re-run `bench` after adding
   models or updating llocal.
 - **Let the agent choose.** It reads `llocal sheet` and picks with `--model`.
+- **Plans.** The skill asks the agent to mark mechanical steps `[local: ...]` when it writes a
+  plan, so the decision is made once, by the agent that sees the whole job.
 - **Close the loop.** `llocal feedback ok|bad` after checking an answer improves routing.
 - **Offload big inputs only.** It pays when files go in by `-f`/`--glob`/stdin and are ~1k+
   tokens, or a long answer goes to `--out`. Pasting text into the command costs more than
