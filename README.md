@@ -102,11 +102,14 @@ citation on every fact:
 - 46 errors in total [count "ERROR" = 46].
 ```
 
-llocal then checks every claim: the quote must be on the cited line (±2), every number in
-the sentence must be in the cited line or count, and counts must match a real `count`/`grep`
-total from that run. A claim that fails is sent back to the model once. If it still fails it is
+llocal then checks every sentence: it must carry a citation, the quote must be on the cited
+line (±2), every number in the sentence must be on that same line (or in the count), every
+file it names must be the cited one, and counts must match a real `count`/`grep` total from
+that run, with the same glob (`[count "ERROR" in "logs/*.log" = 46]`). A claim that fails is sent back to the model once. If it still fails it is
 marked `[UNVERIFIED]` and llocal exits **5**. The agent trusts the verified claims without
-re-reading the input, and checks only the unverified ones.
+re-reading the input, and checks only the unverified ones. What a citation proves is that
+the quoted line exists and holds those numbers; "first", "last", "all", "none" and "because"
+are the model's reading of what it found. Spot-check those when a decision depends on them.
 
 Which models can do it shows in `sheet` (column `tool`, route `explore->`), measured by
 `bench` with a real search over a generated tree. At most `tool_rounds` (12) search rounds

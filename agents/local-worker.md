@@ -21,7 +21,8 @@ You are a coordinator. Do NOT do the work yourself or read whole files: delegate
 3. For code, save it with `--out` and run/test it before accepting it.
 4. After checking a result, record it with the command the run printed on stderr:
    `llocal feedback ok|bad --model <m> --task <t> [--note "<why>"]`.
-   With `--explore`, claims llocal verified need no checking. On exit 5, check only the
+   With `--explore`, claims llocal verified need no re-reading (a citation proves the quoted
+   line and its numbers, not "first/last/all" or a cause: one `grep` if the task depends on it). On exit 5, check only the
    `[UNVERIFIED]` claims by reading their cited lines, then return the answer with those fixed or removed.
 5. If `llocal` exits non-zero other than 5 (read the `llocal: next:` line), or the output is bad twice,
    stop and reply exactly `LOCAL_UNAVAILABLE: <the llocal: error line>` so the main agent does it.

@@ -36,6 +36,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -490,8 +491,12 @@ def chat(model, messages, cfg, max_tokens=2048, temperature=0.2, tools=None):
         raise RuntimeError(f"{model['backend']} returned an unexpected reply ({e.__class__.__name__}: {e})")
 
 
+class ToolsUnsupported(RuntimeError):
+    """The backend refused `tools` for this model."""
+
+
 def tools_rejected(model, body):
-    return RuntimeError(f"{model['name']} does not support tool calling; pick a model with a "
+    return ToolsUnsupported(f"{model['name']} does not support tool calling; pick a model with a "
                         f"'tool' score in `{LLOCAL} sheet` ({body[:200]})")
 
 
@@ -504,7 +509,9 @@ def tool_result_message(model, call, content):
 def _parse_calls(raw):
     calls = []
     for i, tc in enumerate(raw or []):
-        fn = tc.get("function") or {}
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict):
+            raise ValueError(f"malformed tool call: {str(tc)[:80]}")
         args = fn.get("arguments")
         if isinstance(args, str):
             try:
@@ -983,8 +990,10 @@ def bench_tools(model, cfg):
         truth = make_tools_fixture(d)
         try:
             r = explore(model, d, None, TOOLS_QUESTION, "logs", cfg, max_tokens=1024)
-        except Exception as e:
+        except ToolsUnsupported as e:
             return {"tools": 0.0, "tools_suite": TOOLS_SUITE_VERSION, "tools_detail": {"error": str(e)[:200]}}
+        except Exception as e:  # timeout, backend hiccup: no score, so the next `bench` tries again
+            return {"tools_detail": {"error": str(e)[:200]}}
         score = check_explore(r["text"], d, r["log"], truth)
         detail = {"score": round(score, 2), "rounds": r["rounds"], "s": round(r["seconds"], 1)}
         if score < 1:
@@ -1168,7 +1177,8 @@ def cmd_bench(args, cfg):
         if "error" not in res:
             if tools:
                 res.update(bench_tools(m, cfg))
-                eprint(f"    {'tools (explore)':<16} {res['tools']:.2f}")
+                eprint(f"    {'tools (explore)':<16} " + (f"{res['tools']:.2f}" if "tools" in res
+                                                            else f"error: {res['tools_detail']['error'][:80]}"))
             else:
                 res.update({k: prev[k] for k in ("tools", "tools_suite", "tools_detail") if k in prev})
         bench[m["id"]] = res
@@ -1360,6 +1370,13 @@ def tool_list_files(root, log, glob="**/*"):
     return "\n".join(out)
 
 
+def count_key(pattern, glob, log):
+    """Key of a recorded total: the pattern, plus the glob when it narrows the search."""
+    if log.get("only") or glob in (None, "", "*", "**/*", "**"):
+        return pattern
+    return f"{pattern} in {glob}"
+
+
 def tool_grep(root, log, pattern, glob="**/*"):
     rx = re.compile(pattern)
     hits, total = [], 0
@@ -1369,7 +1386,7 @@ def tool_grep(root, log, pattern, glob="**/*"):
                 total += 1
                 if len(hits) < GREP_CAP:
                     hits.append(f"{rel}:{n}: {_clip(line)}")
-    log.setdefault("counts", {})[pattern] = total  # an exact total, as good as `count` for citations
+    log.setdefault("counts", {})[count_key(pattern, glob, log)] = total  # exact, as good as `count`
     return "\n".join(hits + [f"({total} matches, showing {len(hits)})"])
 
 
@@ -1403,7 +1420,7 @@ def tool_count(root, log, pattern, glob="**/*"):
         if n:
             per.append(f"{rel}: {n}")
             total += n
-    log.setdefault("counts", {})[pattern] = total
+    log.setdefault("counts", {})[count_key(pattern, glob, log)] = total
     return "\n".join(per[:LIST_CAP] + [f"total: {total} matching lines"])
 
 
@@ -1433,6 +1450,24 @@ TOOL_SPECS = [
 ]
 
 
+REGEX_TIMEOUT = 10  # seconds per tool call: a model's regex can backtrack forever
+
+
+def _with_deadline(fn, seconds):
+    if not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread():
+        return fn()  # no SIGALRM (Windows) or not the main thread: run without a limit
+
+    def on_alarm(*_):
+        raise ToolError(f"search timed out after {seconds}s; use a simpler regex or a narrower glob")
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return fn()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def run_tool(root, name, args, log):
     """Run one tool call; any mistake by the model comes back as `error: ...` text."""
     try:
@@ -1441,7 +1476,7 @@ def run_tool(root, name, args, log):
             raise ToolError(f"unknown tool {name!r}; use one of {', '.join(TOOLS)}")
         if not isinstance(args, dict):
             raise ToolError("arguments must be a JSON object")
-        out = fn(root, log, **args)
+        out = _with_deadline(lambda: fn(root, log, **args), REGEX_TIMEOUT)
     except ToolError as e:
         out = f"error: {e}"
     except re.error as e:
@@ -1457,14 +1492,19 @@ def run_tool(root, name, args, log):
 
 
 # --------------------------------------------------------------------------- citations
-# Line citation: [path:LINE] "exact quote"   Count citation: [count "PATTERN" = N]
+# Line citation: [path:LINE] "exact quote"
+# Count citation: [count "PATTERN" = N]  or, for a count narrowed by a glob,  [count "PATTERN" in "GLOB" = N]
 
 LINE_CITE = re.compile(r'\[([^\[\]\s:]+(?:[^\[\]:]*[^\[\]\s:])?):(\d+)\]')
-COUNT_CITE = re.compile(r'\[count\s+"(.*?)"\s*=\s*(\d+)\]')
+COUNT_CITE = re.compile(r'\[count\s+"(.*?)"(?:\s+in\s+"(.*?)")?\s*=\s*(\d+)\]')
 QUOTE_SLACK = 2
 _SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 _BULLET = re.compile(r'^(\s*(?:[-*+•]|\d+[.)])\s+)')
 _NUMBER = re.compile(r'\d+(?:[:.]\d+)*')
+_FILE_EXTS = {"py", "js", "ts", "tsx", "jsx", "go", "rs", "java", "kt", "rb", "php", "c", "h", "cc", "cpp",
+              "hpp", "cs", "swift", "md", "rst", "txt", "json", "yaml", "yml", "toml", "ini", "cfg", "conf",
+              "log", "csv", "sh", "sql", "html", "css", "xml", "env", "lock"}
+_FILE_TOKEN = re.compile(r'(?<![\w/.-])[\w.-]*(?:/[\w.-]+)*\.([A-Za-z]\w{0,5})(?![\w/])')
 
 
 def _straight_quotes(s):
@@ -1504,7 +1544,14 @@ def _unmask(s, found):
 
 
 def _is_claim(sentence):
-    return bool(re.search(r'[\d/`"]', sentence))
+    """Every sentence with words is a claim; the line-level exemptions are in verify_answer."""
+    return bool(re.search(r"[A-Za-z0-9]", sentence))
+
+
+def _same_file(a, b):
+    """True if one path is the other, or ends with it at a `/` (svc/config.py ~ config.py)."""
+    a, b = a.strip("./"), b.strip("./")
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
 def _check_line_cite(cite, root, log):
@@ -1529,9 +1576,10 @@ def _check_line_cite(cite, root, log):
         return "", f"{path}: {e.strerror}"
     if not window:
         return "", f"{path}:{n}: no such line"
-    if not any(quote in t for t in window) and quote not in " ".join(window):
+    hits = [t for t in window if quote in t]
+    if not hits and quote not in " ".join(window):
         return "", f"{path}:{n}: quote not found within ±{QUOTE_SLACK} lines"
-    return " ".join(window), ""
+    return " ".join(hits or window), ""  # numbers must come from the matched line, not its neighbours
 
 
 def _check_claim(sentence, root, log):
@@ -1539,23 +1587,40 @@ def _check_claim(sentence, root, log):
     masked, found = _mask_citations(sentence)
     if not found:
         return "no citation"
-    hay = []
+    hay, paths, globs, cited_lines = [], [], [], []
+    counts = log.get("counts", {})
     for cite in found:
         c = COUNT_CITE.fullmatch(cite)
         if c:
-            pat, n = c.group(1), int(c.group(2))
-            real = log.get("counts", {}).get(pat)
+            pat, g, n = c.group(1), c.group(2), int(c.group(3))
+            real = counts.get(count_key(pat, g, log))
             if real is None:
-                return f'count "{pat}": no count call with this exact pattern was made'
+                seen = [f'[count "{k.split(" in ", 1)[0]}" in "{k.split(" in ", 1)[1]}" = {v}]' if " in " in k
+                        else f'[count "{k}" = {v}]' for k, v in counts.items() if k.split(" in ", 1)[0] == pat]
+                return (f'count "{pat}"' + (f' in "{g}"' if g else "") + ": no count with this exact pattern "
+                        "and scope was made" + (f" (recorded: {', '.join(seen)})" if seen else ""))
             if real != n:
                 return f'count "{pat}" = {n}, but the count tool returned {real}'
             hay.append(f"{pat} {n}")
+            globs.append(g or "**/*")
             continue
         text, err = _check_line_cite(cite, root, log)
         if err:
             return err
-        hay.append(f"{LINE_CITE.match(cite).group(2)} {text}")
-    prose, hay = re.sub(r"\x00\d+\x00", " ", masked), " ".join(hay)
+        m = LINE_CITE.match(cite)
+        hay.append(text)
+        paths.append(m.group(1))
+        cited_lines.append(m.group(2))
+    prose, hay = re.sub(r"\x00\d+\x00", " ", masked).replace("`", " "), " ".join(hay)
+    for f in _FILE_TOKEN.finditer(prose):
+        tok = f.group(0)
+        if "/" not in tok and f.group(1).lower() not in _FILE_EXTS:
+            continue
+        if not any(_same_file(tok, p) for p in paths) and not any(_glob_match(tok, g) for g in globs):
+            return f"{tok} is named but not cited"
+    prose = _FILE_TOKEN.sub(" ", prose)
+    for n in cited_lines:  # "on line 50" is proven by the citation itself
+        prose = re.sub(rf"\blines?\s+{n}\b", " ", prose)
     for tok in _NUMBER.findall(prose):
         if not re.search(r"(?<![\d.:])" + re.escape(tok) + r"(?![\d])", hay):
             return f"{tok} does not appear in the cited lines"
@@ -1567,10 +1632,12 @@ def verify_answer(answer, root, log):
 
     Returns {text, claims, verified, failures}; failed claims get " [UNVERIFIED]" in `text`.
     """
-    out, claims, verified, failures = [], 0, 0, []
+    out, claims, verified, failures, fence = [], 0, 0, [], False
     for line in _straight_quotes(answer).splitlines():
         body = line.strip()
-        if not body or body.startswith("#") or body.endswith(":") or set(body) <= set("-*_=|` "):
+        if body.startswith("```"):
+            fence = not fence
+        if fence or not body or body.startswith("#") or body.endswith(":") or set(body) <= set("-*_=|` "):
             out.append(line)
             continue
         m = _BULLET.match(line)
@@ -1601,9 +1668,11 @@ Search before you answer; never guess. When you know enough, answer briefly.
 Every sentence or bullet that states a fact must end with a citation, which llocal checks mechanically:
 - a line: [path:LINE] "exact text copied from that line"
 - a number of occurrences: [count "PATTERN" = N], where PATTERN is exactly what you passed to the \
-count tool and N is the total it returned.
+count (or grep) tool and N is the total it returned; if you passed a glob, cite it too: \
+[count "PATTERN" in "GLOB" = N].
 Use the count tool, never your own counting, for any "how many". Every number you state must appear \
-in the line or count you cite. Copy the quote from the tool output. Facts without a valid citation \
+in the line or count you cite, and every file you name must be the one you cite. Copy the quote \
+from the tool output. Write only facts with citations: no filler sentences. Facts without a valid citation \
 (including one without a quote) are marked [UNVERIFIED].
 
 Example answer:
@@ -1632,6 +1701,9 @@ def _root_listing(root, max_entries=60):
     return "\n".join(out) or "(empty)"
 
 
+EXPLORE_CHARS_PER_TOKEN = 2.5
+
+
 def explore(model, root, one_file, question, task, cfg, max_tokens, messages=None, log=None):
     """Let the model search `root` with read-only tools until it answers.
 
@@ -1658,8 +1730,8 @@ def explore(model, root, one_file, question, task, cfg, max_tokens, messages=Non
             tot[k] += res[k]
         return res
 
-    def over_budget():
-        return est_tokens(json.dumps(messages)) > budget
+    def over_budget():  # logs and code tokenize denser than prose: count conservatively
+        return len(json.dumps(messages)) / EXPLORE_CHARS_PER_TOKEN > budget
 
     rounds, res = 0, None
     while rounds < cfg["tool_rounds"] and not over_budget():

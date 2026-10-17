@@ -474,5 +474,74 @@ class ToolsBenchTest(unittest.TestCase):
         self.assertEqual(len(reqs), 2)                      # nothing left to run
 
 
+class ReviewFixesTest(TreeCase):
+    """Findings from the final review: each reproduces a way a false claim passed or a run broke."""
+
+    def v(self, a, log=None):
+        r = L.verify_answer(a, self.root, log or self.log)
+        return r["claims"], r["verified"]
+
+    def test_number_must_be_on_the_matched_line_not_a_neighbour(self):
+        # line 51 is "2026-10-14T14:00:51 INFO tick 51": its time must not prove a claim about line 50
+        self.assertEqual(self.v('First error at 14:00:51 [logs/app.log:50] "ERROR db pool exhausted".'), (1, 0))
+
+    def test_cited_line_number_is_not_evidence_for_a_value(self):
+        self.assertEqual(self.v('It ran 50 checks [logs/app.log:50] "ERROR db pool exhausted".'), (1, 0))
+        self.assertEqual(self.v('It is on line 50 [logs/app.log:50] "ERROR db pool exhausted".'), (1, 1))
+
+    def test_every_sentence_is_a_claim(self):
+        a = ('- First error [logs/app.log:50] "ERROR db pool exhausted".\n'
+             '- The worker never retries on timeouts.\n'
+             '- First error [logs/app.log:50] "ERROR db pool exhausted". It is overridden later.')
+        self.assertEqual(self.v(a), (4, 2))
+
+    def test_path_named_in_prose_must_be_cited(self):
+        self.assertEqual(self.v('Main is defined in src/b.py [src/a.py:3] "def main():".'), (1, 0))
+        self.assertEqual(self.v('Main is defined in `src/a.py` [src/a.py:3] "def main():".'), (1, 1))
+        self.assertEqual(self.v('Main is defined in a.py [src/a.py:3] "def main():".'), (1, 1))
+
+    def test_count_scope_is_part_of_the_citation(self):
+        L.run_tool(self.root, "count", {"pattern": "ERROR", "glob": "logs/*"}, self.log)
+        self.assertEqual(self.v('There are 2 errors [count "ERROR" = 2].'), (1, 0))
+        self.assertEqual(self.v('There are 2 errors [count "ERROR" in "logs/*" = 2].'), (1, 1))
+
+    def test_catastrophic_regex_times_out(self):
+        with open(os.path.join(self.root, "src", "a.py"), "a") as f:
+            f.write("a" * 40 + "\n")
+        old, L.REGEX_TIMEOUT = L.REGEX_TIMEOUT, 1
+        self.addCleanup(setattr, L, "REGEX_TIMEOUT", old)
+        r = L.run_tool(self.root, "grep", {"pattern": "(a+)+$b", "glob": "src/*"}, self.log)
+        self.assertTrue(r.startswith("error:") and "timed out" in r, r)
+
+
+class ReviewFixesChatTest(unittest.TestCase):
+    def test_malformed_tool_calls_are_runtime_error(self):
+        url, _, stop = start_fake([{"role": "assistant", "content": "", "tool_calls": ["oops"]}])
+        self.addCleanup(stop)
+        m = {"id": "s", "backend": "server", "name": "fake", "url": url}
+        with self.assertRaises(RuntimeError):
+            L.chat(m, [{"role": "user", "content": "q"}], {"request_timeout": 10}, tools=L.TOOL_SPECS)
+
+    def test_transient_bench_error_is_not_a_final_score(self):
+        url, _, stop = start_fake([{"status": 500, "body": "boom"}])
+        self.addCleanup(stop)
+        r = L.bench_tools({"id": "s", "backend": "server", "name": "fake", "url": url}, dict(L.DEFAULT_CONFIG))
+        self.assertNotIn("tools_suite", r)
+        self.assertIn("error", r["tools_detail"])
+
+
+class ReviewBudgetTest(TreeCase):
+    run_cli = ExploreRunTest.run_cli
+
+    def test_context_budget_is_conservative(self):
+        script = [tool_call("read_lines", {"path": "logs/app.log", "start": 1, "end": 200}),
+                  final('First error [logs/app.log:50] "ERROR db pool exhausted".')]
+        p = self.run_cli(script, ["run", "--explore", self.root, "--max-tokens", "512", "q"], cfg={"ctx": 4096})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        budget_chars = (4096 - 512 - 512) * 2.5
+        for r in self.requests:
+            self.assertLessEqual(len(json.dumps(r["messages"])), budget_chars + 200)
+
+
 if __name__ == "__main__":
     unittest.main()
