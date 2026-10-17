@@ -1307,6 +1307,142 @@ def run_tool(root, name, args, log):
     return out
 
 
+# --------------------------------------------------------------------------- citations
+# Line citation: [path:LINE] "exact quote"   Count citation: [count "PATTERN" = N]
+
+LINE_CITE = re.compile(r'\[([^\[\]\s:]+(?:[^\[\]:]*[^\[\]\s:])?):(\d+)\]')
+COUNT_CITE = re.compile(r'\[count\s+"(.*?)"\s*=\s*(\d+)\]')
+QUOTE_SLACK = 2
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
+_BULLET = re.compile(r'^(\s*(?:[-*+•]|\d+[.)])\s+)')
+_NUMBER = re.compile(r'\d+(?:[:.]\d+)*')
+
+
+def _straight_quotes(s):
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"')
+    return s.replace("‘", "'").replace("’", "'")
+
+
+def _norm(s):
+    return " ".join(_straight_quotes(s).split())
+
+
+def _mask_citations(line):
+    """Replace each citation (with its quote) by a placeholder so sentence splitting skips it."""
+    spans = [(m.start(), m.end()) for m in COUNT_CITE.finditer(line)]
+    line_cites = [m for m in LINE_CITE.finditer(line)
+                  if not any(a <= m.start() < b for a, b in spans)]
+    for i, m in enumerate(line_cites):
+        end = m.end()
+        nxt = line_cites[i + 1].start() if i + 1 < len(line_cites) else len(line)
+        nxt = min([nxt] + [a for a, _ in spans if a >= end])
+        seg = line[end:nxt]
+        if seg.lstrip().startswith('"') and seg.count('"') >= 2:
+            end += seg.rindex('"') + 1  # the quote runs to the last " before the next citation
+        spans.append((m.start(), end))
+    spans.sort()
+    found, out, pos = [], [], 0
+    for a, b in spans:
+        out.append(line[pos:a] + f"\x00{len(found)}\x00")
+        found.append(line[a:b])
+        pos = b
+    out.append(line[pos:])
+    return "".join(out), found
+
+
+def _unmask(s, found):
+    return re.sub(r"\x00(\d+)\x00", lambda m: found[int(m.group(1))], s)
+
+
+def _is_claim(sentence):
+    return bool(re.search(r'[\d/`"]', sentence))
+
+
+def _check_line_cite(cite, root, log):
+    """(haystack, error): the cited window's text, or why the citation fails."""
+    m = LINE_CITE.match(cite)
+    path, n = m.group(1), int(m.group(2))
+    quote = _norm(cite[m.end():].strip().strip('"'))
+    only = log.get("only")
+    if only and os.path.basename(path) == only:
+        path = only
+    if only and path != only:
+        return "", f"{path}: only {only} is explored"
+    try:
+        p = safe_path(root, path)
+    except ToolError as e:
+        return "", str(e)
+    if len(quote.replace(" ", "")) < 3:
+        return "", f"{path}:{n}: no quote (cite as [{path}:{n}] \"exact text from the line\")"
+    try:
+        window = [_norm(t) for k, t in _lines(p) if abs(k - n) <= QUOTE_SLACK]
+    except OSError as e:
+        return "", f"{path}: {e.strerror}"
+    if not window:
+        return "", f"{path}:{n}: no such line"
+    if not any(quote in t for t in window) and quote not in " ".join(window):
+        return "", f"{path}:{n}: quote not found within ±{QUOTE_SLACK} lines"
+    return " ".join(window), ""
+
+
+def _check_claim(sentence, root, log):
+    """Reason the claim fails, or "" if all its citations verify."""
+    masked, found = _mask_citations(sentence)
+    if not found:
+        return "no citation"
+    hay = []
+    for cite in found:
+        c = COUNT_CITE.fullmatch(cite)
+        if c:
+            pat, n = c.group(1), int(c.group(2))
+            real = log.get("counts", {}).get(pat)
+            if real is None:
+                return f'count "{pat}": no count call with this exact pattern was made'
+            if real != n:
+                return f'count "{pat}" = {n}, but the count tool returned {real}'
+            hay.append(f"{pat} {n}")
+            continue
+        text, err = _check_line_cite(cite, root, log)
+        if err:
+            return err
+        hay.append(f"{LINE_CITE.match(cite).group(2)} {text}")
+    prose, hay = re.sub(r"\x00\d+\x00", " ", masked), " ".join(hay)
+    for tok in _NUMBER.findall(prose):
+        if not re.search(r"(?<![\d.:])" + re.escape(tok) + r"(?![\d])", hay):
+            return f"{tok} does not appear in the cited lines"
+    return ""
+
+
+def verify_answer(answer, root, log):
+    """Check every factual sentence's citations against the files and this run's counts.
+
+    Returns {text, claims, verified, failures}; failed claims get " [UNVERIFIED]" in `text`.
+    """
+    out, claims, verified, failures = [], 0, 0, []
+    for line in _straight_quotes(answer).splitlines():
+        body = line.strip()
+        if not body or body.startswith("#") or body.endswith(":") or set(body) <= set("-*_=|` "):
+            out.append(line)
+            continue
+        m = _BULLET.match(line)
+        prefix = m.group(1) if m else line[:len(line) - len(line.lstrip())]
+        masked, found = _mask_citations(line[len(prefix):])
+        parts = []
+        for sent in _SENTENCE_SPLIT.split(masked.strip()):
+            sent = _unmask(sent, found)
+            if _is_claim(sent):
+                claims += 1
+                why = _check_claim(sent, root, log)
+                if why:
+                    failures.append(f"{why} -- in: {sent[:100]}")
+                    sent += " [UNVERIFIED]"
+                else:
+                    verified += 1
+            parts.append(sent)
+        out.append(prefix + " ".join(parts))
+    return {"text": "\n".join(out), "claims": claims, "verified": verified, "failures": failures}
+
+
 def cmd_run(args, cfg):
     check_task(args.task)
     if args.timeout:

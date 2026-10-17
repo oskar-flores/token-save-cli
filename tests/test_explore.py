@@ -115,5 +115,74 @@ class ToolsTest(TreeCase):
         self.assertEqual(c.exception.code, 1)
 
 
+class VerifyTest(TreeCase):
+    def test_good_answer_verifies(self):
+        L.run_tool(self.root, "count", {"pattern": "ERROR"}, self.log)
+        a = ('## Incident\nFirst error at 14:02:17 [logs/app.log:50] "14:02:17 ERROR db pool exhausted".\n'
+             'There were 2 errors [count "ERROR" = 2].')
+        v = L.verify_answer(a, self.root, self.log)
+        self.assertEqual((v["claims"], v["verified"]), (2, 2))
+        self.assertNotIn("[UNVERIFIED]", v["text"])
+
+    def test_wrong_line_tolerance(self):
+        a = 'First error [logs/app.log:52] "ERROR db pool exhausted".'      # within ±2
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 1)
+        a = 'First error [logs/app.log:60] "ERROR db pool exhausted".'      # too far
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 0)
+
+    def test_uncited_fact_is_unverified(self):
+        a = 'First error [logs/app.log:50] "ERROR db pool exhausted". It happened 46 times.'
+        v = L.verify_answer(a, self.root, self.log)
+        self.assertEqual((v["claims"], v["verified"]), (2, 1))
+        self.assertIn("46 times. [UNVERIFIED]", v["text"])
+        self.assertEqual(len(v["failures"]), 1)
+
+    def test_count_must_match_a_real_count_call(self):
+        a = 'There were 3 errors [count "ERROR" = 3].'
+        self.assertEqual(L.verify_answer(a, self.root, {"counts": {"ERROR": 2}})["verified"], 0)
+        self.assertEqual(L.verify_answer(a, self.root, {"counts": {}})["verified"], 0)
+
+    def test_quote_normalization(self):
+        a = 'Error [logs/app.log:50] "14:02:17   ERROR  db pool exhausted".'
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 1)
+        a = 'Error [logs/app.log:50] \u201c14:02:17 ERROR db pool exhausted\u201d.'
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 1)
+
+    def test_quote_with_inner_quote_and_period(self):
+        with open(os.path.join(self.root, "src", "a.py"), "a") as f:
+            f.write('    print("done. Bye")\n')
+        a = 'It prints a message [src/a.py:4] "print("done. Bye")". Main is defined [src/a.py:3] "def main():".'
+        v = L.verify_answer(a, self.root, self.log)
+        self.assertEqual((v["claims"], v["verified"]), (2, 2))
+
+    def test_escape_path_fails_claim(self):
+        a = 'Secret [../../etc/passwd:1] "root".'
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 0)
+
+    def test_zero_citations_all_unverified(self):
+        v = L.verify_answer("The pool was exhausted at 14:02.", self.root, self.log)
+        self.assertEqual((v["claims"], v["verified"]), (1, 0))
+
+    def test_wrong_number_with_real_citation_is_unverified(self):
+        # the eval failure: a real line cited, but the claimed timestamp is not on it
+        a = 'First error at 14:18:33 [logs/app.log:50] "ERROR db pool exhausted".'
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 0)
+        a = 'First error at 14:02 [logs/app.log:50] "ERROR db pool exhausted".'
+        self.assertEqual(L.verify_answer(a, self.root, self.log)["verified"], 1)
+
+    def test_headings_and_connectors_are_not_claims(self):
+        a = '# Summary\nHere is what I found:\n- First error [logs/app.log:50] "ERROR db pool exhausted".'
+        v = L.verify_answer(a, self.root, self.log)
+        self.assertEqual((v["claims"], v["verified"]), (1, 1))
+        self.assertTrue(v["text"].startswith("# Summary\nHere is what I found:\n- First error"))
+
+    def test_single_file_root_accepts_bare_or_full_name(self):
+        root, one = L.explore_root(os.path.join(self.root, "logs", "app.log"))
+        log = {"counts": {}, "read_chars": 0, "only": one}
+        for cite in ["app.log", "logs/app.log"]:
+            a = f'First error [{cite}:50] "ERROR db pool exhausted".'
+            self.assertEqual(L.verify_answer(a, root, log)["verified"], 1, cite)
+
+
 if __name__ == "__main__":
     unittest.main()
