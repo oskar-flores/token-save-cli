@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -241,6 +243,141 @@ class ChatToolsTest(unittest.TestCase):
             L.http_json, L.stop_server, L.unload_ollama_all = orig
         self.assertEqual(r["tool_calls"], [{"id": "call_0", "name": "count", "args": {"pattern": "ERROR"}}])
         self.assertEqual(sent[0]["tools"], L.TOOL_SPECS)
+
+
+def tool_call(name, args):
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": f"c_{name}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}
+
+
+def final(text):
+    return {"role": "assistant", "content": text}
+
+
+class ExploreRunTest(TreeCase):
+    def run_cli(self, script, argv, cfg=None):
+        url, self.requests, stop = start_fake(script)
+        self.addCleanup(stop)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+        conf = {"servers": [url], "ollama_url": "http://127.0.0.1:9", "gguf_dirs": [], **(cfg or {})}
+        with open(os.path.join(self.home, "config.json"), "w") as f:
+            json.dump(conf, f)
+        scores = {c: 1.0 for c in L.CATEGORIES}
+        with open(os.path.join(self.home, "bench.json"), "w") as f:
+            json.dump({f"server:{url}#fake": {"scores": scores, "overall": 1, "tps": 50, "suite": L.SUITE_VERSION,
+                                               "tools": 1.0, "tools_suite": 1}}, f)
+        env = dict(os.environ, LLOCAL_HOME=self.home)
+        return subprocess.run([sys.executable, SCRIPT] + argv, env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=60)
+
+    def last_usage(self):
+        with open(os.path.join(self.home, "usage.jsonl")) as f:
+            return json.loads(f.read().splitlines()[-1])
+
+    def test_explore_verified_exit0(self):
+        script = [tool_call("count", {"pattern": "ERROR"}),
+                  tool_call("grep", {"pattern": "ERROR"}),
+                  final('First error [logs/app.log:50] "14:02:17 ERROR db pool exhausted". '
+                        'There were 2 errors [count "ERROR" = 2].')]
+        p = self.run_cli(script, ["run", "--task", "logs", "--explore", self.root, "When did it fail?"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("verified 2/2 claims", p.stderr)
+        self.assertIn("--model", p.stderr)                      # feedback hint is exact
+        self.assertIn("--task tools", p.stderr)
+        row = self.last_usage()
+        self.assertTrue(row["explore"])
+        self.assertEqual((row["rounds"], row["claims"], row["verified"]), (2, 2, 2))
+        self.assertGreater(row["in_ctx"], 0)
+        self.assertEqual(self.requests[0]["tools"], L.TOOL_SPECS)
+        tool_msgs = [m for m in self.requests[2]["messages"] if m["role"] == "tool"]
+        self.assertIn("total: 2 matching lines", tool_msgs[0]["content"])
+
+    def test_explore_unverified_exit5_after_one_retry(self):
+        bad = final("It failed 46 times at 14:18.")
+        p = self.run_cli([bad, bad], ["run", "--task", "logs", "--explore", self.root, "q"])
+        self.assertEqual(p.returncode, 5, p.stderr)
+        self.assertIn("[UNVERIFIED]", p.stdout)
+        self.assertEqual(len(self.requests), 2)   # exactly one retry
+        self.assertIn("could not verify", self.requests[1]["messages"][-1]["content"])
+        self.assertFalse(self.last_usage()["verified"] == self.last_usage()["claims"])
+
+    def test_retry_that_fixes_the_answer_exits0(self):
+        p = self.run_cli([final("It failed at 14:18."),
+                          final('It failed at 14:02:17 [logs/app.log:50] "ERROR db pool exhausted".')],
+                         ["run", "--task", "logs", "--explore", self.root, "q"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("[UNVERIFIED]", p.stdout)
+
+    def test_uncited_prose_only_answer_is_unverified(self):
+        bad = final("The database pool ran out.")
+        p = self.run_cli([bad, bad], ["run", "--task", "logs", "--explore", self.root, "q"])
+        self.assertEqual(p.returncode, 5, p.stderr)
+
+    def test_round_cap_forces_answer(self):
+        loop = tool_call("list_files", {"glob": "*"})
+        p = self.run_cli([loop] * 3 + [final('x [logs/app.log:50] "ERROR db pool exhausted".')],
+                         ["run", "--task", "logs", "--explore", self.root, "q"], cfg={"tool_rounds": 3})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.requests), 4)
+        self.assertNotIn("tools", self.requests[-1])
+
+    def test_single_file_explore(self):
+        script = [tool_call("grep", {"pattern": "ERROR"}),
+                  final('First error [app.log:50] "ERROR db pool exhausted".')]
+        p = self.run_cli(script, ["run", "--task", "logs", "--explore",
+                                  os.path.join(self.root, "logs", "app.log"), "q"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("app.log: 300 lines", self.requests[0]["messages"][-1]["content"])
+
+    def test_out_file_gets_marked_text(self):
+        out = os.path.join(tempfile.mkdtemp(), "ans.md")
+        bad = final("It failed 46 times.")
+        p = self.run_cli([bad], ["run", "--explore", self.root, "--out", out, "q"])
+        self.assertEqual(p.returncode, 5, p.stderr)
+        with open(out) as f:
+            self.assertIn("[UNVERIFIED]", f.read())
+
+    def test_explore_rejects_files(self):
+        for extra in (["-f", "x"], ["--glob", "*.py"], ["--json"], ["-"]):
+            p = self.run_cli([], ["run", "--explore", self.root] + extra + ["q"])
+            self.assertEqual(p.returncode, 1, extra)
+            self.assertIn("can't be combined", p.stderr)
+
+    def test_explore_missing_path(self):
+        p = self.run_cli([], ["run", "--explore", "/nope", "q"])
+        self.assertEqual(p.returncode, 1)
+
+    def test_tools_rejected_exit2(self):
+        p = self.run_cli([{"status": 400, "body": "model does not support tools"}],
+                         ["run", "--explore", self.root, "q"])
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("does not support tool calling", p.stderr)
+
+    def test_no_tools_score_exit3(self):
+        self.run_cli([], ["doctor"])
+        with open(os.path.join(self.home, "bench.json")) as f:
+            b = json.load(f)
+        for v in b.values():
+            v.pop("tools"), v.pop("tools_suite")
+        with open(os.path.join(self.home, "bench.json"), "w") as f:
+            json.dump(b, f)
+        env = dict(os.environ, LLOCAL_HOME=self.home)
+        p = subprocess.run([sys.executable, SCRIPT, "run", "--explore", self.root, "q"], env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 3, p.stderr)
+
+    def test_feedback_on_explore_run_rates_tools(self):
+        script = [final('First error [logs/app.log:50] "ERROR db pool exhausted".')]
+        self.run_cli(script, ["run", "--task", "logs", "--explore", self.root, "q"])
+        env = dict(os.environ, LLOCAL_HOME=self.home)
+        p = subprocess.run([sys.executable, SCRIPT, "feedback", "ok"], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'tools'", p.stdout)
+        p = subprocess.run([sys.executable, SCRIPT, "run", "--task", "tools", "x"], env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 1)
 
 
 if __name__ == "__main__":

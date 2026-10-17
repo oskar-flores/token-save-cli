@@ -8,6 +8,7 @@ llocal — delegate work to local models (Ollama / llama.cpp) instead of paid AP
   llocal sheet                  compact cheat sheet so the calling agent can choose a model itself
   llocal run --task code -f a.py -f b.py "prompt"     run on the best local model
   cat x.log | llocal run --task logs "prompt" -       ('-' = also read stdin)
+  llocal run --task logs --explore logs/ "question"  model searches with read-only tools, cites lines
   llocal feedback ok|bad        after verifying the last run's output: real-world score per model
   llocal stats                  tokens moved off the paid API and estimated savings
   llocal stop                   stop the llama-server that llocal started
@@ -15,6 +16,7 @@ llocal — delegate work to local models (Ollama / llama.cpp) instead of paid AP
 Exit codes (stable, agents rely on them):
   0 ok | 1 bad input | 2 backend down/failed | 3 no local model good enough -> do it yourself
   4 --json requested but output was not valid JSON
+  5 --explore answered, but some claims are [UNVERIFIED] (the rest were checked against the files)
 
 Only the Python standard library is used. Config and results live in ~/.llocal/
 (override with LLOCAL_HOME).
@@ -77,6 +79,8 @@ DEFAULT_CONFIG = {
     "request_timeout": 600,
     # bench stops early on models slower than this (tok/s): too slow to save anyone time
     "min_tps": 5,
+    # `run --explore`: most tool-call rounds before the model must answer
+    "tool_rounds": 12,
 }
 
 # Task types accepted by `run`/`pick`, mapped to benchmark categories.
@@ -938,11 +942,20 @@ def read_jsonl(path):
     return rows
 
 
+# `run --explore` answers are rated as this pseudo-task; it is not a `run --task` value.
+EXPLORE_TASK = "tools"
+
+
+def feedback_category(task):
+    return "tools" if task == EXPLORE_TASK else TASK_TO_CATEGORY.get(task)
+
+
 def field_stats():
     """{(model_id, category): [ok, total]} from `llocal feedback`; category None = all tasks."""
     st = {}
     for r in read_jsonl(FEEDBACK_PATH):
-        for key in ((r.get("model"), TASK_TO_CATEGORY.get(r.get("task"))), (r.get("model"), None)):
+        cat = feedback_category(r.get("task"))
+        for key in ((r.get("model"), cat), (r.get("model"), None)):
             ok_n = st.setdefault(key, [0, 0])
             ok_n[0] += r.get("verdict") == "ok"
             ok_n[1] += 1
@@ -1166,6 +1179,7 @@ def read_files(paths, max_chars):
 # --------------------------------------------------------------------------- explore tools
 
 LIST_CAP, GREP_CAP, READ_CAP, LINE_CAP = 200, 50, 200, 400
+TOOL_OUT_CAP = 12000  # chars per tool result (~3.4k tokens), so one call can't fill the context
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
 
 
@@ -1343,6 +1357,8 @@ def run_tool(root, name, args, log):
         out = f"error: bad arguments: {e}"
     except OSError as e:
         out = f"error: {e.strerror or e}"
+    if len(out) > TOOL_OUT_CAP:
+        out = out[:TOOL_OUT_CAP] + f"\n(output cut at {TOOL_OUT_CAP} chars; ask for fewer lines)"
     log["read_chars"] = log.get("read_chars", 0) + len(out)
     return out
 
@@ -1483,10 +1499,213 @@ def verify_answer(answer, root, log):
     return {"text": "\n".join(out), "claims": claims, "verified": verified, "failures": failures}
 
 
+# --------------------------------------------------------------------------- explore loop
+
+EXPLORE_SYSTEM = """You answer questions about files you cannot see directly. You can only see them \
+through the tools: list_files, grep, read_lines and count. Paths are relative to the explored root. \
+Search before you answer; never guess. When you know enough, answer briefly.
+
+Every sentence or bullet that states a fact must end with a citation, which llocal checks mechanically:
+- a line: [path:LINE] "exact text copied from that line"
+- a number of occurrences: [count "PATTERN" = N], where PATTERN is exactly what you passed to the \
+count tool and N is the total it returned.
+Use the count tool, never your own counting, for any "how many". Every number you state must appear \
+in the line or count you cite. Facts without a valid citation are marked [UNVERIFIED]."""
+
+EXPLORE_RETRY = ("llocal could not verify these claims:\n{failures}\n\nFix them: search again if "
+                 "needed, then give the whole answer again with a valid citation for every fact. "
+                 "Leave out any claim you cannot cite.")
+
+
+def _root_listing(root, max_entries=60):
+    """Two levels of the tree, so the model knows where to start looking."""
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
+        rel = os.path.relpath(d, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= 2:
+            dirs[:] = []
+        prefix = "" if rel == "." else rel + "/"
+        out += [f"{prefix}{x}/" for x in dirs] + [f"{prefix}{x}" for x in sorted(files)]
+        if len(out) > max_entries:
+            return "\n".join(out[:max_entries] + [f"... (more; use list_files)"])
+    return "\n".join(out) or "(empty)"
+
+
+def explore(model, root, one_file, question, task, cfg, max_tokens, messages=None, log=None):
+    """Let the model search `root` with read-only tools until it answers.
+
+    Pass back `messages` and `log` from an earlier call to continue that conversation (retry).
+    Returns {text, rounds, log, messages, prompt_tokens, completion_tokens, seconds}.
+    """
+    log = log if log is not None else {"counts": {}, "read_chars": 0, "only": one_file}
+    if messages is None:
+        if one_file:
+            p = os.path.join(root, one_file)
+            n = sum(1 for _ in _lines(p))
+            where = f"Explored file:\n{one_file}: {n} lines, {os.path.getsize(p) / 1024:.0f} KB"
+        else:
+            where = "Explored root (first two levels):\n" + _root_listing(root)
+        messages = [{"role": "system", "content": EXPLORE_SYSTEM},
+                    {"role": "user", "content": f"{question}\n\n{where}"}]
+    budget = cfg["ctx"] - max_tokens - 512
+    tot = {"prompt_tokens": 0, "completion_tokens": 0, "seconds": 0.0}
+
+    def call(with_tools):
+        res = chat(model, messages, cfg, max_tokens=max_tokens, temperature=0.2,
+                   tools=TOOL_SPECS if with_tools else None)
+        for k in tot:
+            tot[k] += res[k]
+        return res
+
+    def over_budget():
+        return est_tokens(json.dumps(messages)) > budget
+
+    rounds, res = 0, None
+    while rounds < cfg["tool_rounds"] and not over_budget():
+        res = call(True)
+        if not res["tool_calls"]:
+            break
+        rounds += 1
+        messages.append(res["message"])
+        for c in res["tool_calls"]:
+            messages.append(tool_result_message(model, c, run_tool(root, c["name"], c["args"], log)))
+        res = None
+    if res is None:  # round cap or context nearly full: answer from what was read
+        for m in messages:
+            if over_budget():
+                if m["role"] == "tool":
+                    m["content"] = "(dropped to save context)"
+            else:
+                break
+        messages.append({"role": "user", "content": "Stop searching. Answer now with citations."})
+        res = call(False)
+    messages.append({"role": "assistant", "content": res["text"]})
+    return {"text": res["text"], "rounds": rounds, "log": log, "messages": messages, **tot}
+
+
+def rank_tools(cfg, models):
+    """Like rank(), on the `tools` benchmark score; models without one (or without tool support) are out."""
+    available = {m["id"] for m in models if m.get("tools") is not False}
+    field = field_stats()
+    out = []
+    for mid, res in load_bench().items():
+        if "tools" not in res or mid not in available:
+            continue
+        s = blended(res["tools"], field.get((mid, "tools")))
+        if s < cfg["min_score"]:
+            continue
+        speed = min(res.get("tps", 0) / 40.0, 1.0)
+        out.append((round(s + 0.15 * speed, 4), s, mid, res))
+    out.sort(key=lambda x: (x[0], x[3].get("overall", 0), x[3].get("tps", 0)), reverse=True)
+    return out
+
+
+def best_fitting(ranked, models, cfg, label):
+    """The best-ranked model that fits in free GPU memory now (waits briefly), else exit 2."""
+    by_id = {m["id"]: m for m in models}
+    room, hogs = gpu_room(cfg)
+    fitting = [x for x in ranked if room is None or needs_room(by_id[x[2]]) <= room]
+    if not fitting:  # maybe memory is still being released: wait for the smallest candidate
+        room, hogs = wait_for_room(cfg, min(needs_room(by_id[x[2]]) for x in ranked))
+        fitting = [x for x in ranked if room is None or needs_room(by_id[x[2]]) <= room]
+    if not fitting:
+        raise Fail(2, f"GPU busy: only {gb(room)} VRAM free, the best model for '{label}' "
+                      f"needs ~{gb(needs_room(by_id[ranked[0][2]]))}" + (f" (in use by: {hogs})" if hogs else ""),
+                   "do the task yourself now; tell the user the GPU is busy")
+    return by_id[fitting[0][2]]
+
+
+def feedback_hint(model, task):
+    return f"-> after checking it: `{LLOCAL} feedback ok|bad --model {nick(model['id'])} --task {task}`"
+
+
+def _verify_explore(text, root, log):
+    v = verify_answer(text, root, log)
+    if not v["claims"]:  # nothing checkable: plain prose must not pass as verified
+        v = {"text": text + "\n[UNVERIFIED] (no cited facts)", "claims": 1, "verified": 0,
+             "failures": ["the answer states no fact with a citation"]}
+    return v
+
+
+def run_explore(args, cfg):
+    words = list(args.prompt or [])
+    if args.files or args.globs or args.json or "-" in words:
+        raise Fail(1, "--explore can't be combined with -f/--glob/stdin/--json",
+                   "pass a directory or one file to --explore")
+    question = " ".join(words).strip()
+    if not question:
+        raise Fail(1, "empty prompt", "give the question as an argument")
+    root, one = explore_root(args.explore)
+    if cfg["ctx"] - args.max_tokens - 512 < 2048:
+        raise Fail(1, f"--max-tokens {args.max_tokens} leaves no room for tool results in ctx={cfg['ctx']}",
+                   "lower --max-tokens or raise ctx in config")
+    if args.model:
+        model = find_model(args.model, cfg)
+    else:
+        models = discover(cfg)
+        r = rank_tools(cfg, models)
+        if not r:
+            scored = [k for k, v in load_bench().items() if v.get("tools", 0) >= cfg["min_score"]]
+            if scored:
+                raise Fail(2, f"models that can explore are not reachable now ({', '.join(map(short, scored[:3]))})",
+                           f"is Ollama / llama-server running? see `{LLOCAL} doctor`; meanwhile " + NO_MODEL_HINT)
+            raise Fail(3, f"no local model has a tool-use score >= min_score={cfg['min_score']}",
+                       f"do it yourself; a human can run `{LLOCAL} bench` to measure tool use")
+        model = best_fitting(r, models, cfg, "explore")
+
+    eprint(f"[llocal] {short(model['id'])} exploring {args.explore}... (first call loads the model)")
+    res = explore(model, root, one, question, args.task, cfg, args.max_tokens)
+    if not res["text"].strip():
+        raise Fail(2, f"{short(model['id'])} returned an empty answer", "do it yourself")
+    v = _verify_explore(res["text"], root, res["log"])
+    if v["verified"] < v["claims"]:
+        eprint(f"[llocal] {v['claims'] - v['verified']} of {v['claims']} claims unverified; asking the model "
+               "to fix them once")
+        fails = "\n".join("- " + f for f in v["failures"])
+        res["messages"].append({"role": "user", "content": EXPLORE_RETRY.format(failures=fails)})
+        again = explore(model, root, one, question, args.task, cfg, args.max_tokens,
+                        messages=res["messages"], log=res["log"])
+        for k in ("prompt_tokens", "completion_tokens", "seconds", "rounds"):
+            res[k] += again[k]
+        if again["text"].strip():
+            res["text"] = again["text"]
+            v = _verify_explore(res["text"], root, res["log"])
+    out = v["text"]
+    if args.out:
+        try:
+            with open(args.out, "w") as f:
+                f.write(out + "\n")
+        except OSError as e:
+            raise Fail(1, f"cannot write --out {args.out}: {e.strerror}")
+        print(f"wrote {args.out} ({len(out)} chars)")
+    else:
+        print(out)
+    row = {"ts": time.time(), "task": args.task, "model": model["id"], "explore": True,
+           "in": res["prompt_tokens"], "out": res["completion_tokens"],
+           "in_ctx": res["log"]["read_chars"] * 2 // 7, "in_prompt": est_tokens(question),
+           "to_file": bool(args.out), "s": round(res["seconds"], 1),
+           "rounds": res["rounds"], "claims": v["claims"], "verified": v["verified"]}
+    ensure_home()
+    with open(USAGE_PATH, "a") as f:
+        f.write(json.dumps(row) + "\n")
+    eprint(f"[llocal] verified {v['verified']}/{v['claims']} claims")
+    eprint(f"[llocal] {short(model['id'])}  rounds={res['rounds']} read={res['log']['read_chars']} chars "
+           f"in={res['prompt_tokens']} out={res['completion_tokens']}  {res['seconds']:.1f}s  "
+           + feedback_hint(model, EXPLORE_TASK))
+    missing = v["claims"] - v["verified"]
+    if missing:
+        raise Fail(5, f"{missing} of {v['claims']} claims unverified",
+                   "trust the verified lines; check only the [UNVERIFIED] lines by reading those lines")
+
+
 def cmd_run(args, cfg):
     check_task(args.task)
     if args.timeout:
         cfg["request_timeout"] = args.timeout
+    if args.explore:
+        return run_explore(args, cfg)
     # stdin is read only when asked (`-` in the prompt words): inside agents stdin is often an
     # open non-tty pipe and reading it blindly would hang forever.
     words = list(args.prompt or [])
@@ -1528,17 +1747,7 @@ def cmd_run(args, cfg):
         r = rank(args.task, cfg, models)
         if not r:
             raise no_model_failure(args.task, cfg)
-        by_id = {m["id"]: m for m in models}
-        room, hogs = gpu_room(cfg)
-        fitting = [x for x in r if room is None or needs_room(by_id[x[2]]) <= room]
-        if not fitting:  # maybe memory is still being released: wait for the smallest candidate
-            room, hogs = wait_for_room(cfg, min(needs_room(by_id[x[2]]) for x in r))
-            fitting = [x for x in r if room is None or needs_room(by_id[x[2]]) <= room]
-        if not fitting:
-            raise Fail(2, f"GPU busy: only {gb(room)} VRAM free, the best model for '{args.task}' "
-                          f"needs ~{gb(needs_room(by_id[r[0][2]]))}" + (f" (in use by: {hogs})" if hogs else ""),
-                       "do the task yourself now; tell the user the GPU is busy")
-        model = by_id[fitting[0][2]]
+        model = best_fitting(r, models, cfg, args.task)
 
     cat = TASK_TO_CATEGORY[args.task]
     msgs = [{"role": "system", "content": SYSTEM_PROMPTS.get(cat, SYSTEM_PROMPTS[None])},
@@ -1572,7 +1781,7 @@ def cmd_run(args, cfg):
     with open(USAGE_PATH, "a") as f:
         f.write(json.dumps(row) + "\n")
     eprint(f"[llocal] {short(model['id'])}  in={res['prompt_tokens']} out={res['completion_tokens']} "
-           f"{res['tps']:.0f} tok/s  {res['seconds']:.1f}s  -> after checking it: `{LLOCAL} feedback ok|bad`")
+           f"{res['tps']:.0f} tok/s  {res['seconds']:.1f}s  " + feedback_hint(model, args.task))
     if net_saving(row, cfg) < 0:
         eprint("[llocal] note: this run likely cost more API tokens than doing it yourself (small input, "
                "answer read back); offload inputs of ~1k+ tokens passed by -f/--glob/stdin")
@@ -1580,19 +1789,23 @@ def cmd_run(args, cfg):
 
 def cmd_feedback(args, cfg):
     runs = read_jsonl(USAGE_PATH)
+
+    def rated_task(r):
+        return EXPLORE_TASK if r.get("explore") else r["task"]
     if args.model:
         model = find_model(args.model, cfg)["id"]
-        task = args.task or next((r["task"] for r in reversed(runs) if r.get("model") == model), "general")
+        task = args.task or next((rated_task(r) for r in reversed(runs) if r.get("model") == model), "general")
     elif runs:
-        model, task = runs[-1]["model"], args.task or runs[-1]["task"]
+        model, task = runs[-1]["model"], args.task or rated_task(runs[-1])
     else:
         raise Fail(1, "no local run to give feedback on", "run `llocal run ...` first, or pass --model")
-    check_task(task)
+    if task != EXPLORE_TASK:
+        check_task(task)
     ensure_home()
     with open(FEEDBACK_PATH, "a") as f:
         f.write(json.dumps({"ts": time.time(), "model": model, "task": task, "verdict": args.verdict,
                             "note": args.note or ""}) + "\n")
-    ok, n = field_stats().get((model, TASK_TO_CATEGORY[task]), [0, 0])
+    ok, n = field_stats().get((model, feedback_category(task)), [0, 0])
     print(f"recorded {args.verdict} for {short(model)} on '{task}' ({ok}/{n} ok in that category)")
 
 
@@ -1656,10 +1869,13 @@ def main():
     r.add_argument("--timeout", type=int, help="seconds to wait for the model (default: request_timeout)")
     r.add_argument("--out", help="write the answer to this file instead of stdout")
     r.add_argument("--json", action="store_true", help="validate and pretty-print JSON output")
+    r.add_argument("--explore", metavar="PATH",
+                   help="let the model search this directory or file with read-only tools; every fact "
+                        "it states is checked against the cited lines (exit 5 if some are not)")
     fb = sub.add_parser("feedback", help="record whether the last run's output was right (after verifying)")
     fb.add_argument("verdict", choices=["ok", "bad"])
     fb.add_argument("--model", help="model to rate (default: the one used by the last run)")
-    fb.add_argument("--task", help="task type to rate (default: the last run's)")
+    fb.add_argument("--task", help=f"task type to rate (default: the last run's; '{EXPLORE_TASK}' for --explore runs)")
     fb.add_argument("--note", help="short reason, e.g. 'tests failed: off-by-one'")
     sub.add_parser("stats", help="tokens offloaded and estimated savings")
     sub.add_parser("stop", help="stop llama-server / unload Ollama models")
