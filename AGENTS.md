@@ -18,6 +18,7 @@ memory (16 GB+) or a PC with an NVIDIA GPU.
 | `agents/local-worker.md` | Optional Claude Code subagent (Haiku) that only coordinates and delegates to `llocal`. |
 | `install.sh` | Optional: `llocal` command in `~/.local/bin`, skill and agent in `~/.claude/`. |
 | `README.md` | User documentation. |
+| `tests/` | `unittest` suite (stdlib) with a scripted fake OpenAI-compatible server (`fake_server.py`). |
 
 Runtime state: `~/.llocal/` (`config.json`, `bench.json`, `usage.jsonl`, `feedback.jsonl`,
 `server.json`, `llama-server.log`). Redirect it with `LLOCAL_HOME=/other/path`;
@@ -34,7 +35,7 @@ Runtime state: `~/.llocal/` (`config.json`, `bench.json`, `usage.jsonl`, `feedba
 - Local models only: Ollama cloud models (`remote_host`) are always excluded.
 - Keep the **exit codes** stable; the skill and agent depend on them:
   `0` ok · `1` bad input · `2` backend error · `3` no suitable local model ·
-  `4` `--json` without valid JSON.
+  `4` `--json` without valid JSON · `5` `--explore` answered with some claims unverified.
 - Memory: never two models loaded at once (`stop_server` / `unload_ollama_all`). Don't add
   parallel model execution.
 - `llocal run` must not read stdin unless `-` is passed (inside agents stdin can be an open
@@ -49,13 +50,20 @@ Runtime state: `~/.llocal/` (`config.json`, `bench.json`, `usage.jsonl`, `feedba
   `llocal sheet` is the compact view for agents: keep it short (one line per model).
 - The benchmark runs model-generated code (`run_python_tests`). Don't widen what runs, and
   don't remove the `timeout` / `python -I`.
+- `--explore` tools stay **read-only and scoped to the given root** (`safe_path` resolves
+  symlinks). Never add a tool that writes, runs commands or reaches the network there. A
+  claim counts as verified only if `verify_answer` checked it; don't loosen that to pass a model.
+- The tool-use test is versioned apart from `SUITE` (`TOOLS_SUITE_VERSION`): bump that one when
+  you change `make_tools_fixture`, `check_explore` or `TOOLS_QUESTION`.
 - Everything is in English: docs, skill, code, comments and CLI messages.
 
 ## Testing
 
-There is no test suite. Minimum checks after a change:
+Run the suite (no GPU needed; it uses a temp `LLOCAL_HOME` and a fake server), then the
+minimum checks:
 
 ```bash
+python3 -m unittest discover -s tests -v
 L=skills/local-offload/scripts/llocal.py
 python3 -m py_compile $L
 export LLOCAL_HOME="$(mktemp -d)"

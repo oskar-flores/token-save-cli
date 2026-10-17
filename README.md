@@ -8,6 +8,8 @@ logs, JSON extraction and docstrings. `llocal` runs that work on an **Ollama** o
 the agent's context.
 
 - Picks the model **by benchmark**, and only models that fit your GPU/memory.
+- **`--explore`**: the local model searches a whole repo or a multi-MB log with read-only
+  tools, and llocal **checks every citation** in its answer before the agent sees it.
 - Gives the agent a **cheat sheet** of what each local model is good at.
 - **Fails fast** with a clear exit code when no local model is good enough.
 - Reports the **net** API cost saved, and warns when an offload wasn't worth it.
@@ -67,8 +69,10 @@ llocal pick --task code                       # which model would be used
 llocal run --task logs -f app.log "What failed?"
 llocal run --task summary --glob 'src/**/*.py' "one line per module"
 git diff | llocal run --task docs "commit message" -
+llocal run --task logs --explore logs/worker.log "First error, count, cause"
+llocal run --task explain --explore src "Where is auth checked? cite file:line"
 
-llocal feedback ok|bad [--note ...]           # rate the last answer
+llocal feedback ok|bad --model M --task T [--note ...]   # rate an answer (run prints this)
 llocal stats                                  # tokens offloaded and net savings
 llocal stop                                   # free the memory
 ```
@@ -85,6 +89,31 @@ llocal stop                                   # free the memory
 
 <br>
 
+## Explore: big inputs, verified answers
+
+`-f` puts whole files in the prompt, so it stops at the model's context (~40 KB with the
+default `ctx`). `--explore PATH` (a directory or one file) instead gives the model four
+read-only tools, `list_files`, `grep`, `read_lines` and `count`, limited to that path
+(no `.git`, no binary files, no symlinks out of it). The model searches, then answers with a
+citation on every fact:
+
+```
+- First error at 14:02:17 [logs/worker.log:812] "14:02:17 ERROR db pool exhausted".
+- 46 errors in total [count "ERROR" = 46].
+```
+
+llocal then checks every claim: the quote must be on the cited line (±2), every number in
+the sentence must be in the cited line or count, and counts must match a real `count`/`grep`
+total from that run. A claim that fails is sent back to the model once. If it still fails it is
+marked `[UNVERIFIED]` and llocal exits **5**. The agent trusts the verified claims without
+re-reading the input, and checks only the unverified ones.
+
+Which models can do it shows in `sheet` (column `tool`, route `explore->`), measured by
+`bench` with a real search over a generated tree. At most `tool_rounds` (12) search rounds
+per answer.
+
+<br>
+
 ## Exit codes
 
 Errors print `llocal: error: …` and `llocal: next: …` (what to do).
@@ -96,6 +125,7 @@ Errors print `llocal: error: …` and `llocal: next: …` (what to do).
 | 2 | backend down, GPU busy, timeout or broken reply |
 | 3 | no local model good enough (or no benchmark): the agent does it |
 | 4 | `--json` requested but the output is not JSON |
+| 5 | `--explore` answered, but some claims are `[UNVERIFIED]` (the rest were checked) |
 
 <br>
 
@@ -104,15 +134,19 @@ Errors print `llocal: error: …` and `llocal: next: …` (what to do).
 - **Benchmark once.** No benchmark = no trusted model (exit 3). Re-run `bench` after adding
   models or updating llocal.
 - **Let the agent choose.** It reads `llocal sheet` and picks with `--model`.
-- **Plans.** The skill asks the agent to mark mechanical steps `[local: ...]` when it writes a
-  plan, so the decision is made once, by the agent that sees the whole job.
-- **Close the loop.** `llocal feedback ok|bad` after checking an answer improves routing.
+- **Plans.** The skill asks the agent to mark mechanical steps `[local: ...]` (with `-f` or
+  `--explore`) when it writes a plan, so the decision is made once, by the agent that sees the
+  whole job.
+- **Close the loop.** `llocal feedback ok|bad` after checking an answer improves routing. Use
+  the exact command `run` prints (with `--model`/`--task`): two agents sharing llocal would
+  otherwise rate each other's runs.
 - **Offload big inputs only.** It pays when files go in by `-f`/`--glob`/stdin and are ~1k+
   tokens, or a long answer goes to `--out`. Pasting text into the command costs more than
   doing it yourself. `llocal stats` shows the net saving (bad-rated runs don't count) and
   `run` warns on stderr when a run likely lost money.
 - **One model at a time.** Don't run calls in parallel.
-- **Verify.** Local models are weaker: run their code, check their facts.
+- **Verify.** Local models are weaker: run their code, check their facts. With `--explore`,
+  llocal has already checked the cited facts.
 - **Local only.** Ollama `:cloud`, audio and embedding models are ignored.
 - **Team use.** Add to your repo's `AGENTS.md` / `CLAUDE.md`:
   `Before summarizing/extracting/documenting large files, use the local-offload skill.`
@@ -131,6 +165,7 @@ File: `~/.llocal/config.json` (or set `LLOCAL_HOME`).
 | `ctx` | 16384 | model context; lower it if memory is tight |
 | `min_score` | 0.6 | minimum score (0–1) to use a model |
 | `min_tps` | 5 | slower models (tok/s) are dropped in `bench` |
+| `tool_rounds` | 12 | `--explore`: max search rounds before the model must answer |
 | `request_timeout` | 600 | seconds to wait (or `run --timeout`) |
 | `ollama_url` | `http://localhost:11434` | |
 | `servers` | `[]` | other OpenAI-compatible endpoints |
