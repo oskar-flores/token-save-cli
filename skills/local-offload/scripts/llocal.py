@@ -20,6 +20,7 @@ Only the Python standard library is used. Config and results live in ~/.llocal/
 (override with LLOCAL_HOME).
 """
 import argparse
+import fnmatch
 import glob
 import http.client
 import json
@@ -1120,6 +1121,190 @@ def read_files(paths, max_chars):
                           f"~{max_chars * 2 // 7})", "split it into smaller calls, or do it yourself")
         parts.append(f"=== FILE: {p} ===\n{content}\n=== END FILE: {p} ===")
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- explore tools
+
+LIST_CAP, GREP_CAP, READ_CAP, LINE_CAP = 200, 50, 200, 400
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+
+
+class ToolError(Exception):
+    """A tool call the model got wrong: the message goes back to the model as the result."""
+
+
+def explore_root(path):
+    """(root_dir, single_file_rel_or_None) for `--explore PATH`."""
+    p = os.path.realpath(os.path.expanduser(path))
+    if os.path.isdir(p):
+        return p, None
+    if os.path.isfile(p):
+        return os.path.dirname(p), os.path.basename(p)
+    raise Fail(1, f"--explore {path}: no such file or directory", "pass an existing directory or one file")
+
+
+def safe_path(root, rel):
+    """Absolute real path of `rel` under `root`; symlinks are resolved before the check."""
+    if not isinstance(rel, str) or not rel.strip():
+        raise ToolError("path is required")
+    root = os.path.realpath(root)
+    p = os.path.realpath(os.path.join(root, rel))
+    if p != root and not p.startswith(root + os.sep):
+        raise ToolError(f"{rel}: outside the explored root")
+    if SKIP_DIRS & set(os.path.relpath(p, root).split(os.sep)):
+        raise ToolError(f"{rel}: not searchable")
+    if not os.path.exists(p):
+        raise ToolError(f"{rel}: no such file")
+    return p
+
+
+def _is_binary(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" in f.read(4096)
+    except OSError:
+        return True
+
+
+def _glob_match(rel, pat):
+    return fnmatch.fnmatch(rel, pat) or (pat.startswith("**/") and fnmatch.fnmatch(rel, pat[3:]))
+
+
+def _walk(root, pat, log):
+    """Root-relative text files matching `pat`; only `log["only"]` for a single-file root."""
+    pat = pat or "**/*"
+    if not isinstance(pat, str):
+        raise ToolError("glob must be a string")
+    if log.get("only"):
+        cands = [log["only"]]
+    else:
+        cands = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS)
+            for name in sorted(files):
+                rel = os.path.relpath(os.path.join(d, name), root)
+                if _glob_match(rel, pat):
+                    cands.append(rel)
+    for rel in cands:
+        try:
+            p = safe_path(root, rel)
+        except ToolError:
+            continue
+        if os.path.isfile(p) and not _is_binary(p):
+            yield rel, p
+
+
+def _lines(path):
+    with open(path, errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            yield n, line.rstrip("\n")
+
+
+def _clip(line):
+    return line if len(line) <= LINE_CAP else f"{line[:LINE_CAP]} ...(+{len(line) - LINE_CAP} chars)"
+
+
+def tool_list_files(root, log, glob="**/*"):
+    files = list(_walk(root, glob, log))
+    if not files:
+        return "no files match"
+    out = [f"{rel} ({os.path.getsize(p)} B)" for rel, p in files[:LIST_CAP]]
+    if len(files) > LIST_CAP:
+        out.append(f"({len(files)} files, showing {LIST_CAP}; narrow the glob)")
+    return "\n".join(out)
+
+
+def tool_grep(root, log, pattern, glob="**/*"):
+    rx = re.compile(pattern)
+    hits, total = [], 0
+    for rel, p in _walk(root, glob, log):
+        for n, line in _lines(p):
+            if rx.search(line):
+                total += 1
+                if len(hits) < GREP_CAP:
+                    hits.append(f"{rel}:{n}: {_clip(line)}")
+    return "\n".join(hits + [f"({total} matches, showing {len(hits)})"])
+
+
+def tool_read_lines(root, log, path, start=1, end=None):
+    if log.get("only") and os.path.normpath(path) != log["only"]:
+        raise ToolError(f"only {log['only']} can be read")
+    p = safe_path(root, path)
+    if not os.path.isfile(p) or _is_binary(p):
+        raise ToolError(f"{path}: not a text file")
+    start = max(1, int(start))
+    end = int(end) if end is not None else start + READ_CAP - 1
+    last = min(end, start + READ_CAP - 1)
+    out, total = [], 0
+    for n, line in _lines(p):
+        total = n
+        if start <= n <= last:
+            out.append(f"{n}: {_clip(line)}")
+    if not out:
+        raise ToolError(f"{path} has {total} lines; start={start} is past the end")
+    shown = int(out[-1].split(":", 1)[0])
+    if shown < min(end, total):
+        out.append(f"(showing {start}-{shown} of {total} lines; call again with start={shown + 1})")
+    return "\n".join(out)
+
+
+def tool_count(root, log, pattern, glob="**/*"):
+    rx = re.compile(pattern)
+    per, total = [], 0
+    for rel, p in _walk(root, glob, log):
+        n = sum(1 for _, line in _lines(p) if rx.search(line))
+        if n:
+            per.append(f"{rel}: {n}")
+            total += n
+    log.setdefault("counts", {})[pattern] = total
+    return "\n".join(per[:LIST_CAP] + [f"total: {total} matching lines"])
+
+
+TOOLS = {"list_files": tool_list_files, "grep": tool_grep, "read_lines": tool_read_lines,
+         "count": tool_count}
+
+
+def _spec(name, desc, props, required):
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": {
+        "type": "object", "properties": props, "required": required}}}
+
+
+_GLOB = {"type": "string", "description": "file glob relative to the root, e.g. **/*.py (default: all)"}
+TOOL_SPECS = [
+    _spec("list_files", "List text files under the root with their sizes.", {"glob": _GLOB}, []),
+    _spec("grep", f"Search lines with a Python regex. Returns path:line: text (max {GREP_CAP}) "
+                  "and the total number of matches.",
+          {"pattern": {"type": "string", "description": "Python regular expression"}, "glob": _GLOB},
+          ["pattern"]),
+    _spec("read_lines", f"Read numbered lines of one file (max {READ_CAP} per call).",
+          {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}},
+          ["path", "start", "end"]),
+    _spec("count", "Count the lines matching a Python regex, per file and in total. Use it for any "
+                   "'how many' question.",
+          {"pattern": {"type": "string", "description": "Python regular expression"}, "glob": _GLOB},
+          ["pattern"]),
+]
+
+
+def run_tool(root, name, args, log):
+    """Run one tool call; any mistake by the model comes back as `error: ...` text."""
+    try:
+        fn = TOOLS.get(name)
+        if fn is None:
+            raise ToolError(f"unknown tool {name!r}; use one of {', '.join(TOOLS)}")
+        if not isinstance(args, dict):
+            raise ToolError("arguments must be a JSON object")
+        out = fn(root, log, **args)
+    except ToolError as e:
+        out = f"error: {e}"
+    except re.error as e:
+        out = f"error: invalid regex: {e}"
+    except (TypeError, ValueError) as e:
+        out = f"error: bad arguments: {e}"
+    except OSError as e:
+        out = f"error: {e.strerror or e}"
+    log["read_chars"] = log.get("read_chars", 0) + len(out)
+    return out
 
 
 def cmd_run(args, cfg):
