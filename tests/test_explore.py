@@ -82,6 +82,10 @@ class ToolsTest(TreeCase):
         L.run_tool(self.root, "count", {"pattern": "ERROR"}, self.log)
         self.assertEqual(self.log["counts"]["ERROR"], 2)
 
+    def test_grep_total_counts_as_a_count(self):
+        L.run_tool(self.root, "grep", {"pattern": "ERROR"}, self.log)
+        self.assertEqual(self.log["counts"]["ERROR"], 2)
+
     def test_read_lines_numbered_and_capped(self):
         r = L.run_tool(self.root, "read_lines", {"path": "logs/app.log", "start": 1, "end": 999}, self.log)
         self.assertTrue(r.startswith("1: "))
@@ -378,6 +382,96 @@ class ExploreRunTest(TreeCase):
         p = subprocess.run([sys.executable, SCRIPT, "run", "--task", "tools", "x"], env=env,
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 1)
+
+
+def good_tools_answer(t):
+    return (f'First ERROR at {t["first_ts"]} [svc/worker.log:{t["first_line"]}] "{t["first_ts"]} ERROR". '
+            f'There are 17 ERROR lines [count "ERROR" = 17]. '
+            f'RETRY_LIMIT is 7 [{t["const_path"]}:{t["const_line"]}] "RETRY_LIMIT = 7".')
+
+
+class ToolsBenchTest(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d)
+
+    def test_check_explore_good_and_bad(self):
+        t = L.make_tools_fixture(self.d)
+        log = {"counts": {"ERROR": 17}, "read_chars": 0}
+        self.assertEqual(L.check_explore(good_tools_answer(t), self.d, log, t), 1.0)
+        bad = "First ERROR at 03:00, about 20 ERROR lines, RETRY_LIMIT is 5."
+        self.assertEqual(L.check_explore(bad, self.d, log, t), 0.0)
+
+    def test_check_explore_partial(self):
+        t = L.make_tools_fixture(self.d)
+        log = {"counts": {"ERROR": 17}, "read_chars": 0}
+        a = good_tools_answer(t).replace("[count \"ERROR\" = 17]", "")  # count claim uncited
+        self.assertEqual(L.check_explore(a, self.d, log, t), 0.75)
+
+    def test_fixture_is_deterministic(self):
+        b = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, b)
+        t = L.make_tools_fixture(self.d)
+        self.assertEqual(t, L.make_tools_fixture(b))
+        self.assertEqual(t["errors"], 17)
+        log = {"counts": {}, "read_chars": 0}
+        L.run_tool(self.d, "count", {"pattern": "ERROR"}, log)
+        self.assertEqual(log["counts"]["ERROR"], 17)
+        with open(os.path.join(self.d, "svc", "worker.log")) as f:
+            lines = f.read().splitlines()
+        self.assertGreater(len(lines), 2500)
+        self.assertTrue(lines[t["first_line"] - 1].startswith(t["first_ts"] + " ERROR"))
+        self.assertFalse(any(" ERROR" in x for x in lines[:t["first_line"] - 1]))
+
+    def test_tools_not_in_overall(self):
+        self.assertNotIn("tools", L.CATEGORIES)
+
+    def fake_model(self, script):
+        url, reqs, stop = start_fake(script)
+        self.addCleanup(stop)
+        return {"id": f"server:{url}#fake", "backend": "server", "name": "fake", "url": url}, reqs
+
+    def test_bench_tools_with_good_model(self):
+        t = L.make_tools_fixture(self.d)
+        m, _ = self.fake_model([tool_call("count", {"pattern": "ERROR"}), final(good_tools_answer(t))])
+        r = L.bench_tools(m, dict(L.DEFAULT_CONFIG))
+        self.assertEqual((r["tools"], r["tools_suite"]), (1.0, L.TOOLS_SUITE_VERSION))
+        self.assertEqual(r["tools_detail"]["rounds"], 1)
+
+    def test_bench_tools_rejected_scores_zero(self):
+        m, _ = self.fake_model([{"status": 400, "body": "does not support tools"}])
+        r = L.bench_tools(m, dict(L.DEFAULT_CONFIG))
+        self.assertEqual(r["tools"], 0.0)
+        self.assertIn("error", r["tools_detail"])
+
+    def test_bench_runs_only_missing_tools_test(self):
+        t = L.make_tools_fixture(self.d)
+        url, reqs, stop = start_fake([tool_call("count", {"pattern": "ERROR"}), final(good_tools_answer(t))])
+        self.addCleanup(stop)
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        with open(os.path.join(home, "config.json"), "w") as f:
+            json.dump({"servers": [url], "ollama_url": "http://127.0.0.1:9", "gguf_dirs": []}, f)
+        mid = f"server:{url}#fake"
+        with open(os.path.join(home, "bench.json"), "w") as f:
+            json.dump({mid: {"scores": {c: 1.0 for c in L.CATEGORIES}, "overall": 1, "tps": 50,
+                             "suite": L.SUITE_VERSION, "details": []}}, f)
+        env = dict(os.environ, LLOCAL_HOME=home)
+        p = subprocess.run([sys.executable, SCRIPT, "bench"], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(reqs), 2)                      # only the tools test ran
+        with open(os.path.join(home, "bench.json")) as f:
+            res = json.load(f)[mid]
+        self.assertEqual((res["tools"], res["tools_suite"], res["overall"]), (1.0, L.TOOLS_SUITE_VERSION, 1))
+        p = subprocess.run([sys.executable, SCRIPT, "sheet"], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+        self.assertIn("code json summ reas tool", p.stdout)
+        self.assertIn("1.00 1.00 1.00 1.00 1.00", p.stdout)
+        self.assertIn(f"explore->{mid}", p.stdout)
+        p = subprocess.run([sys.executable, SCRIPT, "bench"], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(len(reqs), 2)                      # nothing left to run
 
 
 if __name__ == "__main__":

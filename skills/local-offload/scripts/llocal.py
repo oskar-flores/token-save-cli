@@ -28,6 +28,7 @@ import http.client
 import json
 import os
 import platform
+import random
 import re
 import secrets
 import shutil
@@ -306,7 +307,8 @@ def discover(cfg, verbose=False):
             if caps is not None and "completion" not in caps:
                 continue  # embedding, or a decision model (e.g. nimble): not a chat model
             models.append({"id": "ollama:" + name, "backend": "ollama", "name": name,
-                           "size": int(m.get("size", 0))})
+                           "size": int(m.get("size", 0)),
+                           "tools": None if caps is None else "tools" in caps})
     except Exception as e:
         if verbose:
             eprint(f"  Ollama not reachable at {cfg['ollama_url']} ({e.__class__.__name__})")
@@ -918,6 +920,80 @@ def bench_model(model, cfg, quick=False):
             "date": time.strftime("%Y-%m-%d %H:%M")}
 
 
+# Tool-use test (`run --explore`): a real search loop over a generated tree. Kept apart from
+# SUITE so adding it doesn't re-run the whole suite: bump TOOLS_SUITE_VERSION if it changes.
+TOOLS_SUITE_VERSION = 1
+TOOLS_QUESTION = ("When was the first ERROR in svc/worker.log, how many ERROR lines are there, and where "
+                  "is RETRY_LIMIT defined and to what value?")
+
+
+def make_tools_fixture(dirpath):
+    """Write a deterministic tree (a ~3000-line log with 17 ERROR lines, 3 .py files); return the truth."""
+    rng = random.Random(4)
+    svc = os.path.join(dirpath, "svc")
+    os.makedirs(svc, exist_ok=True)
+    n_lines, errors = 3000, 17
+    err_at = set(rng.sample(range(1200, n_lines), errors))
+    t = time.mktime((2026, 3, 9, 6, 0, 0, 0, 0, -1))
+    lines, first = [], None
+    for i in range(1, n_lines + 1):
+        t += rng.randint(1, 9)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+        job = rng.randint(1000, 9999)
+        if i in err_at:
+            lines.append(f"{ts} ERROR worker job={job} failed: upstream timeout after 30s")
+            first = first or (ts, i)
+        elif rng.random() < 0.08:
+            lines.append(f"{ts} WARN  worker job={job} slow upstream ({rng.randint(2, 9)}s), will retry on error")
+        else:
+            lines.append(f"{ts} INFO  worker job={job} done in {rng.randint(5, 900)}ms")
+    with open(os.path.join(svc, "worker.log"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    files = {
+        "util.py": "import time\n\n# RETRY_LIMIT used to be 5; see config.py\nMAX_RETRY_DELAY = 30\n\n\n"
+                   "def backoff(attempt):\n    return min(2 ** attempt, MAX_RETRY_DELAY)\n",
+        "config.py": '"""Worker settings."""\n\nUPSTREAM = "http://upstream:8080"\nTIMEOUT_S = 30\n'
+                     "RETRY_LIMIT = 7\nBATCH = 50\n",
+        "worker.py": "from svc.config import RETRY_LIMIT\nfrom svc.util import backoff\n\n\n"
+                     "def run(job):\n    for attempt in range(RETRY_LIMIT):\n        if job.try_once():\n"
+                     "            return True\n        backoff(attempt)\n    return False\n",
+    }
+    for name, body in files.items():
+        with open(os.path.join(svc, name), "w") as f:
+            f.write(body)
+    const_line = files["config.py"].splitlines().index("RETRY_LIMIT = 7") + 1
+    return {"first_ts": first[0], "first_line": first[1], "errors": errors,
+            "const_path": "svc/config.py", "const_line": const_line}
+
+
+def check_explore(answer, root, log, truth):
+    """Mean of: first timestamp, the ERROR count, RETRY_LIMIT's line cited (±2), all claims verified."""
+    parts = [truth["first_ts"].split("T")[1] in answer,
+             bool(re.search(rf"(?<!\d){truth['errors']}(?!\d)", answer)),
+             any(abs(int(n) - truth["const_line"]) <= QUOTE_SLACK
+                 for n in re.findall(re.escape(truth["const_path"]) + r":(\d+)\]", answer))]
+    v = verify_answer(answer, root, log)
+    parts.append(v["claims"] > 0 and v["verified"] == v["claims"])
+    return sum(parts) / len(parts)
+
+
+def bench_tools(model, cfg):
+    d = tempfile.mkdtemp(prefix="llocal-tools-")
+    try:
+        truth = make_tools_fixture(d)
+        try:
+            r = explore(model, d, None, TOOLS_QUESTION, "logs", cfg, max_tokens=1024)
+        except Exception as e:
+            return {"tools": 0.0, "tools_suite": TOOLS_SUITE_VERSION, "tools_detail": {"error": str(e)[:200]}}
+        score = check_explore(r["text"], d, r["log"], truth)
+        detail = {"score": round(score, 2), "rounds": r["rounds"], "s": round(r["seconds"], 1)}
+        if score < 1:
+            detail["answer"] = r["text"][:600]
+        return {"tools": round(score, 3), "tools_suite": TOOLS_SUITE_VERSION, "tools_detail": detail}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- routing
 
 def load_bench():
@@ -1066,25 +1142,35 @@ def cmd_bench(args, cfg):
             eprint(f"skip {short(m['id'])} ({gb(m['size'])} > {gb(budget)}: {why}; --force to try)")
             continue
         prev = bench.get(m["id"], {})
-        if "scores" in prev and prev.get("suite", 1) == SUITE_VERSION and not args.redo:
-            eprint(f"skip {short(m['id'])} (already benchmarked; --redo to repeat)")
-            continue
         if str(prev.get("error", "")).startswith("too slow") and prev.get("suite") == SUITE_VERSION \
                 and not args.redo:
             eprint(f"skip {short(m['id'])} ({prev['error'][:40]}...; --redo to retry)")
             continue
-        todo.append(m)
+        suite = args.redo or not ("scores" in prev and prev.get("suite", 1) == SUITE_VERSION)
+        tools = m.get("tools") is not False and (args.redo or prev.get("tools_suite") != TOOLS_SUITE_VERSION)
+        if not suite and not tools:
+            eprint(f"skip {short(m['id'])} (already benchmarked; --redo to repeat)")
+            continue
+        todo.append((m, suite, tools))
     if not todo:
         eprint("nothing to benchmark")
-    for i, m in enumerate(todo, 1):
-        eprint(f"[{i}/{len(todo)}] {short(m['id'])}  ({gb(m['size']) if m['size'] else '?'})  loading...")
+    for i, (m, suite, tools) in enumerate(todo, 1):
+        eprint(f"[{i}/{len(todo)}] {short(m['id'])}  ({gb(m['size']) if m['size'] else '?'})  loading..."
+               + ("" if suite else "  (tool-use test only)"))
         room, hogs = wait_for_room(cfg, needs_room(m))
         if room is not None and needs_room(m) > room and not args.force:
             eprint(f"    skipped: GPU busy, {gb(room)} VRAM free, needs ~{gb(needs_room(m))}"
                    + (f" (in use by: {hogs})" if hogs else "") + "; free it and re-run, or --force")
             continue
-        res = bench_model(m, cfg, quick=args.quick)
+        prev = bench.get(m["id"], {})
+        res = bench_model(m, cfg, quick=args.quick) if suite else dict(prev)
         res["size"] = m["size"]
+        if "error" not in res:
+            if tools:
+                res.update(bench_tools(m, cfg))
+                eprint(f"    {'tools (explore)':<16} {res['tools']:.2f}")
+            else:
+                res.update({k: prev[k] for k in ("tools", "tools_suite", "tools_detail") if k in prev})
         bench[m["id"]] = res
         with open(BENCH_PATH, "w") as f:
             json.dump(bench, f, indent=2)
@@ -1103,16 +1189,20 @@ def cmd_report(args, cfg):
         print(f"no benchmark results yet; run `{LLOCAL} bench --quick`")
         return
     rows.sort(key=lambda kv: kv[1]["overall"], reverse=True)
-    print(f"\n{'model':<48} {'code':>5} {'json':>5} {'summ':>5} {'reas':>5} {'all':>5} {'tok/s':>6}")
+    print(f"\n{'model':<48} {'code':>5} {'json':>5} {'summ':>5} {'reas':>5} {'all':>5} {'tok/s':>6} {'tools':>5}")
     for k, v in rows:
         s = v["scores"]
         print(f"{short(k)[:48]:<48} " + " ".join(f"{s.get(c, 0):>5.2f}" for c in CATEGORIES) +
-              f" {v['overall']:>5.2f} {v['tps']:>6.1f}" + ("  (quick)" if v.get("quick") else ""))
+              f" {v['overall']:>5.2f} {v['tps']:>6.1f} {tools_cell(v):>5}" + ("  (quick)" if v.get("quick") else ""))
     print("\nBest per task (min_score=%.2f):" % cfg["min_score"])
     models = discover(cfg)
     for task in ["code", "json", "summary", "reason", "general"]:
         r = rank(task, cfg, models)
         print(f"  {task:<8} -> {short(r[0][2]) if r else 'none (the agent does it itself)'}")
+
+
+def tools_cell(v):
+    return f"{v['tools']:.2f}" if "tools" in v and v.get("tools_suite") == TOOLS_SUITE_VERSION else "-"
 
 
 def cmd_sheet(args, cfg):
@@ -1128,7 +1218,7 @@ def cmd_sheet(args, cfg):
     if room is not None:
         print(f"# VRAM usable now: {gb(room)}" + (f" (busy: {hogs})" if hogs else ""))
     field = field_stats()
-    print("model | GB | tok/s | code json summ reas | real ok/n | now | weak spots")
+    print("model | GB | tok/s | code json summ reas tool | real ok/n | now | weak spots")
     for mid, v in sorted(bench.items(), key=lambda kv: -kv[1]["overall"]):
         if mid not in models:
             continue
@@ -1138,17 +1228,19 @@ def cmd_sheet(args, cfg):
         sc = v["scores"]
         old = " (old suite: re-bench)" if v.get("suite", 1) != SUITE_VERSION else ""
         print(f"{nick(mid)}{old} | {m['size'] / 1024 ** 3:.0f} | {v.get('tps', 0):.0f} | "
-              + " ".join(f"{sc.get(c, 0):.2f}" for c in CATEGORIES)
+              + " ".join(f"{sc.get(c, 0):.2f}" for c in CATEGORIES) + f" {tools_cell(v)}"
               + " | {}/{}".format(*field.get((mid, None), [0, 0])) + f" | {now} | "
               + (", ".join(weak) or "-"))
     routes = []
     for task in ["code", "json", "summary", "reason"]:
         r = rank(task, cfg, list(models.values()))
         routes.append(f"{task}->{nick(r[0][2]) if r else 'none'}")
+    r = rank_tools(cfg, list(models.values()))
+    routes.append(f"explore->{nick(r[0][2]) if r else 'none'}")
     print("# default routes: " + ", ".join(routes))
     print("# weak spots = benchmark tests below 1 (code: palindrome merge_intervals code_edit; json: "
           "order_extract tool_plan; summ: log_rootcause long_needle strict_format; reas: boxes weekday). "
-          "Models can't run tools.")
+          f"tool = can search files itself via `run --explore` ({LLOCAL} run --task logs --explore PATH \"question\").")
 
 
 def cmd_pick(args, cfg):
@@ -1277,6 +1369,7 @@ def tool_grep(root, log, pattern, glob="**/*"):
                 total += 1
                 if len(hits) < GREP_CAP:
                     hits.append(f"{rel}:{n}: {_clip(line)}")
+    log.setdefault("counts", {})[pattern] = total  # an exact total, as good as `count` for citations
     return "\n".join(hits + [f"({total} matches, showing {len(hits)})"])
 
 
@@ -1510,7 +1603,13 @@ Every sentence or bullet that states a fact must end with a citation, which lloc
 - a number of occurrences: [count "PATTERN" = N], where PATTERN is exactly what you passed to the \
 count tool and N is the total it returned.
 Use the count tool, never your own counting, for any "how many". Every number you state must appear \
-in the line or count you cite. Facts without a valid citation are marked [UNVERIFIED]."""
+in the line or count you cite. Copy the quote from the tool output. Facts without a valid citation \
+(including one without a quote) are marked [UNVERIFIED].
+
+Example answer:
+- The first failure was at 07:43:59 [logs/app.log:120] "07:43:59 ERROR payment timeout".
+- There are 4 failures [count "ERROR" = 4].
+- MAX_JOBS is 8 [src/settings.py:12] "MAX_JOBS = 8"."""
 
 EXPLORE_RETRY = ("llocal could not verify these claims:\n{failures}\n\nFix them: search again if "
                  "needed, then give the whole answer again with a valid citation for every fact. "
