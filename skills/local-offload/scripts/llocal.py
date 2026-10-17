@@ -466,11 +466,13 @@ def unload_ollama_all(cfg, keep=None):
 
 # --------------------------------------------------------------------------- chat
 
-def chat(model, messages, cfg, max_tokens=2048, temperature=0.2):
-    """Returns dict(text, prompt_tokens, completion_tokens, tps, seconds).
+def chat(model, messages, cfg, max_tokens=2048, temperature=0.2, tools=None):
+    """Returns dict(text, prompt_tokens, completion_tokens, tps, seconds, tool_calls, message).
+    `tool_calls` is [{id, name, args}] (empty without `tools`); `message` is the assistant
+    message to append to `messages`, in the backend's own format.
     Any backend problem (down, timeout, HTTP error, malformed reply) raises RuntimeError."""
     try:
-        return _chat(model, messages, cfg, max_tokens, temperature)
+        return _chat(model, messages, cfg, max_tokens, temperature, tools)
     except RuntimeError:
         raise
     except urllib.error.HTTPError as e:
@@ -482,7 +484,33 @@ def chat(model, messages, cfg, max_tokens=2048, temperature=0.2):
         raise RuntimeError(f"{model['backend']} returned an unexpected reply ({e.__class__.__name__}: {e})")
 
 
-def _chat(model, messages, cfg, max_tokens, temperature):
+def tools_rejected(model, body):
+    return RuntimeError(f"{model['name']} does not support tool calling; pick a model with a "
+                        f"'tool' score in `{LLOCAL} sheet` ({body[:200]})")
+
+
+def tool_result_message(model, call, content):
+    if model["backend"] == "ollama":
+        return {"role": "tool", "tool_name": call["name"], "content": content}
+    return {"role": "tool", "tool_call_id": call["id"], "content": content}
+
+
+def _parse_calls(raw):
+    calls = []
+    for i, tc in enumerate(raw or []):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except ValueError:
+                args = {}
+        calls.append({"id": tc.get("id") or f"call_{i}", "name": fn.get("name", ""),
+                      "args": args if isinstance(args, dict) else {}})
+    return calls
+
+
+def _chat(model, messages, cfg, max_tokens, temperature, tools=None):
     t0 = time.time()
     if model["backend"] == "ollama":
         stop_server(quiet=True)  # free memory held by llama-server
@@ -491,10 +519,14 @@ def _chat(model, messages, cfg, max_tokens, temperature):
         payload = {"model": model["name"], "messages": messages, "stream": False, "think": False,
                    "keep_alive": "10m",
                    "options": {"num_ctx": cfg["ctx"], "num_predict": max_tokens, "temperature": temperature}}
+        if tools:
+            payload["tools"] = tools
         try:
             r = http_json(base + "/api/chat", payload, timeout=cfg["request_timeout"])
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="ignore")
+            if tools and "tools" in body.lower():
+                raise tools_rejected(model, body)
             if "think" in body.lower():  # model without thinking support
                 payload.pop("think")
                 r = http_json(base + "/api/chat", payload, timeout=cfg["request_timeout"])
@@ -503,11 +535,13 @@ def _chat(model, messages, cfg, max_tokens, temperature):
                     raise RuntimeError(f"{model['name']} does not fit in free GPU memory right now "
                                        "(CUDA out of memory); close other GPU programs or use a smaller model")
                 raise RuntimeError(f"Ollama error {e.code}: {body[:300]}")
-        text = strip_thinking(r.get("message", {}).get("content", ""))
+        msg = r.get("message", {})
+        text = strip_thinking(msg.get("content") or "")
         ct = r.get("eval_count", est_tokens(text))
         dur = r.get("eval_duration", 0) / 1e9
         return {"text": text, "prompt_tokens": r.get("prompt_eval_count", 0), "completion_tokens": ct,
-                "tps": ct / dur if dur else ct / max(time.time() - t0, 1e-6), "seconds": time.time() - t0}
+                "tps": ct / dur if dur else ct / max(time.time() - t0, 1e-6), "seconds": time.time() - t0,
+                "tool_calls": _parse_calls(msg.get("tool_calls")), "message": msg}
 
     # llama-server / OpenAI-compatible
     if model["backend"] == "gguf":
@@ -518,17 +552,23 @@ def _chat(model, messages, cfg, max_tokens, temperature):
     payload = {"model": mname, "messages": messages, "max_tokens": max_tokens,
                "temperature": temperature, "stream": False,
                "chat_template_kwargs": {"enable_thinking": False}}
+    if tools:
+        payload["tools"] = tools
     try:
         r = http_json(url + "/v1/chat/completions", payload, timeout=cfg["request_timeout"])
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"server error {e.code}: {e.read().decode(errors='ignore')[:300]}")
+        body = e.read().decode(errors="ignore")
+        if tools and "tool" in body.lower():
+            raise tools_rejected(model, body)
+        raise RuntimeError(f"server error {e.code}: {body[:300]}")
     msg = r["choices"][0]["message"]
     text = strip_thinking(msg.get("content") or "")
     usage = r.get("usage", {})
     ct = usage.get("completion_tokens", est_tokens(text))
     tps = (r.get("timings") or {}).get("predicted_per_second") or ct / max(time.time() - t0, 1e-6)
     return {"text": text, "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": ct,
-            "tps": tps, "seconds": time.time() - t0}
+            "tps": tps, "seconds": time.time() - t0,
+            "tool_calls": _parse_calls(msg.get("tool_calls")), "message": msg}
 
 
 # --------------------------------------------------------------------------- benchmark suite

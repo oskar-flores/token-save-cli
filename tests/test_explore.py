@@ -9,6 +9,8 @@ import shutil
 import tempfile
 import unittest
 
+from tests.fake_server import start_fake
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "skills", "local-offload", "scripts", "llocal.py")
 
@@ -182,6 +184,63 @@ class VerifyTest(TreeCase):
         for cite in ["app.log", "logs/app.log"]:
             a = f'First error [{cite}:50] "ERROR db pool exhausted".'
             self.assertEqual(L.verify_answer(a, root, log)["verified"], 1, cite)
+
+
+class ChatToolsTest(unittest.TestCase):
+    cfg = {"request_timeout": 10, "ctx": 16384, "ollama_url": "http://127.0.0.1:9"}
+
+    def fake(self, script):
+        url, reqs, stop = start_fake(script)
+        self.addCleanup(stop)
+        return {"id": "server:x#fake", "backend": "server", "name": "fake", "url": url}, reqs
+
+    def test_openai_tool_calls_parsed(self):
+        m, reqs = self.fake([{"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "grep", "arguments": '{"pattern":"ERROR"}'}}]}])
+        r = L.chat(m, [{"role": "user", "content": "q"}], self.cfg, tools=L.TOOL_SPECS)
+        self.assertEqual(r["tool_calls"], [{"id": "c1", "name": "grep", "args": {"pattern": "ERROR"}}])
+        self.assertEqual(reqs[0]["tools"], L.TOOL_SPECS)
+        self.assertEqual(r["message"]["tool_calls"][0]["id"], "c1")
+
+    def test_unparsable_arguments_become_empty(self):
+        m, _ = self.fake([{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "grep", "arguments": "{oops"}}]}])
+        r = L.chat(m, [{"role": "user", "content": "q"}], self.cfg, tools=L.TOOL_SPECS)
+        self.assertEqual(r["tool_calls"][0]["args"], {})
+
+    def test_no_tools_key_when_not_asked(self):
+        m, reqs = self.fake([{"role": "assistant", "content": "hi"}])
+        r = L.chat(m, [{"role": "user", "content": "q"}], self.cfg)
+        self.assertNotIn("tools", reqs[0])
+        self.assertEqual((r["text"], r["tool_calls"]), ("hi", []))
+
+    def test_tools_rejected_is_runtime_error(self):
+        m, _ = self.fake([{"status": 400, "body": "model does not support tools"}])
+        with self.assertRaisesRegex(RuntimeError, "does not support tool calling"):
+            L.chat(m, [{"role": "user", "content": "q"}], self.cfg, tools=L.TOOL_SPECS)
+
+    def test_tool_result_message_formats(self):
+        call = {"id": "c1", "name": "grep", "args": {}}
+        self.assertEqual(L.tool_result_message({"backend": "server"}, call, "out"),
+                         {"role": "tool", "tool_call_id": "c1", "content": "out"})
+        self.assertEqual(L.tool_result_message({"backend": "ollama"}, call, "out"),
+                         {"role": "tool", "tool_name": "grep", "content": "out"})
+
+    def test_ollama_tool_calls_parsed(self):
+        m = {"id": "ollama:x", "backend": "ollama", "name": "x"}
+        reply = {"message": {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "count", "arguments": {"pattern": "ERROR"}}}]}, "eval_count": 5}
+        sent = []
+        orig = (L.http_json, L.stop_server, L.unload_ollama_all)
+        L.http_json = lambda url, payload=None, **k: sent.append(payload) or reply
+        L.stop_server = lambda quiet=False: None
+        L.unload_ollama_all = lambda cfg, keep=None: None
+        try:
+            r = L.chat(m, [{"role": "user", "content": "q"}], self.cfg, tools=L.TOOL_SPECS)
+        finally:
+            L.http_json, L.stop_server, L.unload_ollama_all = orig
+        self.assertEqual(r["tool_calls"], [{"id": "call_0", "name": "count", "args": {"pattern": "ERROR"}}])
+        self.assertEqual(sent[0]["tools"], L.TOOL_SPECS)
 
 
 if __name__ == "__main__":
